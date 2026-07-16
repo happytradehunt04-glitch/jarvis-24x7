@@ -1,12 +1,11 @@
 import os
-import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from groq import Groq
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# Render ke liye chota sa web server
+# Render ke liye web server
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -29,7 +28,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = " ".join(context.args) if context.args else "gold"
     if not client:
-        await update.message.reply_text("GROQ_API_KEY missing")
+        await update.message.reply_text("GROQ key missing")
         return
     try:
         res = client.chat.completions.create(
@@ -40,12 +39,12 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
-async def main():
+def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signal", signal))
-    print("Jarvis Started")
-    await app.run_polling()
+    print("Jarvis Started Polling")
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
