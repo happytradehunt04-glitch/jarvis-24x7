@@ -1,5 +1,5 @@
-python-telegram-bot==20.8
-groq
+python-telegram-bot==21.9
+groq==0.13.1
 yfinance
 ta
 mplfinance
