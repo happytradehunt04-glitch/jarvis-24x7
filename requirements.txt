@@ -1,0 +1,7 @@
+python-telegram-bot==20.7
+yfinance
+ta
+mplfinance
+matplotlib
+pandas
+groq
