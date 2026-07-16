@@ -1,50 +1,51 @@
 import os
-import yfinance as yf
-import pandas as pd
-import ta
-import matplotlib.pyplot as plt
-import mplfinance as mpf
-import io
+import asyncio
 from telegram import Update
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from groq import Groq
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-TOKEN = "8700856917:AAEvVtVwQtMty0FqeTYpYdnFJSIfJH0VCe0" # tera token
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Render ko port chahiye isliye chota server
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Jarvis is Alive!")
 
-client = Groq(api_key=GROQ_API_KEY)
+def run_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), Handler)
+    server.serve_forever()
 
-async def get_data(ticker, interval):
-    data = yf.download(ticker, period="14d", interval=interval, progress=False)
-    if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.droplevel(1)
-    data['Close']=data['Close'].squeeze()
-    data['High']=data['High'].squeeze()
-    data['Low']=data['Low'].squeeze()
-    data['RSI']=ta.momentum.RSIIndicator(data['Close']).rsi()
-    data['EMA20']=ta.trend.EMAIndicator(data['Close'],20).ema_indicator()
-    data['EMA50']=ta.trend.EMAIndicator(data['Close'],50).ema_indicator()
-    data['ATR']=ta.volatility.AverageTrueRange(data['High'],data['Low'],data['Close']).average_true_range()
-    return data
+threading.Thread(target=run_server, daemon=True).start()
 
-async def signal(update, context):
-    pair = context.args[0].lower() if context.args else "gold"
-    mp = {"gold":("GC=F","4h","GOLD"),"xauusd":("GC=F","4h","GOLD"),"eurusd":("EURUSD=X","60m","EURUSD"),"gbpusd":("GBPUSD=X","60m","GBPUSD"),"btc":("BTC-USD","15m","BTC")}
-    ticker, interval, name = mp.get(pair, ("GC=F","4h","GOLD"))
-    data = await get_data(ticker, interval)
-    last = data.iloc[-1]
+# Tokens Environment se lega
+TOKEN = os.getenv("BOT_TOKEN")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=GROQ_KEY)
 
-    prompt = f"Give trade plan for {name} Price {last['Close']:.2f} RSI {last['RSI']:.1f} EMA20 {last['EMA20']:.2f} EMA50 {last['EMA50']:.2f}. Format BIAS, ENTRY, SL, TP1, TP2, REASON Hindi"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Jarvis 24x7 Online Boss! /signal gold bhejo")
 
-    comp = client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role":"user","content":prompt}], max_tokens=300)
-    ai = comp.choices[0].message.content
+async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_msg = " ".join(context.args) if context.args else "gold"
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": f"Give a short trading signal analysis for {user_msg}"}],
+            model="llama3-8b-8192",
+        )
+        reply = chat_completion.choices[0].message.content
+        await update.message.reply_text(reply)
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
 
-    await update.message.reply_text(f"📊 {name} 24x7 PLAN\n\n{ai}\n\nPC Band pe bhi working ✅")
-
-def main():
+async def main():
     app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signal", signal))
-    app.add_handler(CommandHandler("gold", signal))
-    print("Cloud Bot Started")
-    app.run_polling()
+    print("Jarvis Cloud 24x7 Started")
+    await app.run_polling()
 
-if __name__ == '__main__': main()
+if __name__ == "__main__":
+    asyncio.run(main())
