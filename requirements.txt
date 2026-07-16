@@ -1,2 +1,7 @@
 python-telegram-bot==21.9
 groq==0.13.1
+yfinance
+pandas
+matplotlib
+mplfinance
+ta
