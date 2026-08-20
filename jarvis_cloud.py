@@ -8,6 +8,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = set()
@@ -15,7 +16,7 @@ CHAT_IDS = set()
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers()
-        self.wfile.write(b"Jarvis V3 Lite Auto Live")
+        self.wfile.write(b"Jarvis V4 Pro Candle Live")
 threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT",10000))), H).serve_forever(), daemon=True).start()
 
 PAIRS = {
@@ -27,7 +28,7 @@ PAIRS = {
 }
 
 def get_df(sym):
-    for per, inter in [("5d","15m"), ("5d","1h"), ("1mo","1d")]:
+    for per, inter in [("2d","15m"), ("5d","1h"), ("1mo","1d")]:
         try:
             df = yf.download(sym, period=per, interval=inter, progress=False, auto_adjust=True)
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
@@ -35,9 +36,7 @@ def get_df(sym):
         except: pass
     return None
 
-def is_session():
-    h = datetime.now().hour + datetime.now().minute/60
-    return 13.5 <= h <= 21.5
+def is_session(): return 13.5 <= datetime.now().hour + datetime.now().minute/60 <= 21.5
 
 def analyse(sym, name):
     df = get_df(sym)
@@ -47,89 +46,70 @@ def analyse(sym, name):
     delta = close.diff(); gain = delta.where(delta>0,0).rolling(14).mean(); loss = -delta.where(delta<0,0).rolling(14).mean(); rsi = 100 - (100/(1+gain/loss))
     rsi_val = float(rsi.iloc[-1]); e50 = float(ema50.iloc[-1]); e200 = float(ema200.iloc[-1])
     asian = close.iloc[-32:-8]; ah = float(asian.max()); al = float(asian.min())
-    
-    # --- NEWS FILTER (Simple) ---
-    is_news_time = datetime.now().weekday() == 4 and 18 <= datetime.now().hour <= 19 # Friday 6-7 PM NFP time
 
     bias="WAIT"; reason=""
-    if is_news_time:
-        reason = "🔴 NFP NEWS - WAIT karo, news ke baad entry"
-    elif price > ah and e50 > e200 and rsi_val > 55:
-        bias="BUY"; reason=f"✅ Asian High {ah:.2f} BREAKOUT\n✅ EMA50 {e50:.2f} > EMA200 {e200:.2f} Bullish\n✅ RSI {rsi_val:.1f} Strong (55+)\n✅ London Session Active"
+    if price > ah and e50 > e200 and rsi_val > 55:
+        bias="BUY"; reason=f"✅ Asian High {ah:.2f} BREAKOUT\n✅ EMA50 {e50:.2f} > EMA200 Bullish\n✅ RSI {rsi_val:.1f} Strong"
     elif price < al and e50 < e200 and rsi_val < 45:
-        bias="SELL"; reason=f"✅ Asian Low {al:.2f} BREAKDOWN\n✅ EMA50 {e50:.2f} < EMA200 {e200:.2f} Bearish\n✅ RSI {rsi_val:.1f} Weak (45-)\n✅ London Session Active"
+        bias="SELL"; reason=f"✅ Asian Low {al:.2f} BREAKDOWN\n✅ EMA50 {e50:.2f} < EMA200 Bearish\n✅ RSI {rsi_val:.1f} Weak"
     else:
-        reason=f"❌ Price Asian Range me hai ({al:.2f} - {ah:.2f})\n❌ EMA Trend match nahi\n❌ RSI {rsi_val:.1f} Neutral"
+        reason=f"❌ Range me: {al:.2f} - {ah:.2f}\n❌ EMA {e50:.2f}/{e200:.2f}\n❌ RSI {rsi_val:.1f} Neutral"
 
-    # Chart
+    # --- PRO CANDLE CHART (Bina mplfinance ke) ---
+    d = df[-40:].copy()
     buf = io.BytesIO()
-    fig, ax = plt.subplots(figsize=(6,3))
-    ax.plot(close[-60:], color='black', linewidth=1)
-    ax.plot(ema50[-60:], color='blue', linewidth=0.8, label='EMA50')
-    ax.plot(ema200[-60:], color='orange', linewidth=0.8, label='EMA200')
-    ax.axhline(ah, color='green', ls='--', lw=0.8, label=f'AH {ah:.0f}'); ax.axhline(al, color='red', ls='--', lw=0.8, label=f'AL {al:.0f}')
-    ax.set_title(f"{name} {price:.2f} RSI {rsi_val:.1f}"); ax.legend(fontsize=6)
-    plt.tight_layout(); plt.savefig(buf, format='png', dpi=130); buf.seek(0); plt.close(fig)
+    fig, ax = plt.subplots(figsize=(7,3.5))
+    # Candle banane ka logic
+    for i in range(len(d)):
+        o = float(d['Open'].iloc[i]); h = float(d['High'].iloc[i]); l = float(d['Low'].iloc[i]); c = float(d['Close'].iloc[i])
+        color = 'green' if c >= o else 'red'
+        ax.plot([i, i], [l, h], color=color, linewidth=0.8)
+        ax.plot([i, i], [o, c], color=color, linewidth=3)
+    ax.plot(ema50[-40:].values, color='blue', lw=0.8, label='EMA50')
+    ax.plot(ema200[-40:].values, color='orange', lw=0.8, label='EMA200')
+    ax.axhline(ah, color='green', ls='--', lw=0.8); ax.axhline(al, color='red', ls='--', lw=0.8)
+    ax.set_title(f"{name} {price:.2f} | RSI {rsi_val:.1f} | {bias}"); ax.legend(fontsize=6)
+    plt.tight_layout(); plt.savefig(buf, format='png', dpi=150); buf.seek(0); plt.close(fig)
 
     if bias=="WAIT":
-        msg=f"""**{name} | {price:.2f} | {bias}**
-
-**Reason - Buy/Sell Kyu Nahi:**
-{reason}
-
-**Levels:**
-Asian High: {ah:.2f}
-Asian Low: {al:.2f}
-EMA50: {e50:.2f} | EMA200: {e200:.2f}
-
-**News:** {'NFP Time - Avoid' if is_news_time else 'No Major News'}
-**Action:** WAIT - No Trade
-"""
+        msg=f"**{name} | {price:.2f} | {bias}**\n\n{reason}\n\nAH: {ah:.2f} | AL: {al:.2f}\nAction: WAIT"
     else:
-        sl_p=0.004; tp1_p=0.008; tp2_p=0.015
-        sl=price*(1-sl_p) if bias=="BUY" else price*(1+sl_p)
-        tp1=price*(1+tp1_p) if bias=="BUY" else price*(1-tp1_p)
-        tp2=price*(1+tp2_p) if bias=="BUY" else price*(1-tp2_p)
+        sl=price*0.996 if bias=="BUY" else price*1.004; tp1=price*1.008 if bias=="BUY" else price*0.992; tp2=price*1.015 if bias=="BUY" else price*0.985
         msg=f"""**🚨 {bias} {name} | {price:.2f}**
+ENTRY: {price:.2f}
+SL: {sl:.2f}
+TP1: {tp1:.2f}
+TP2: {tp2:.2f}
+RR 1:2
 
-**ENTRY:** {price:.2f}
-**SL:** {sl:.2f} (-0.4%)
-**TP1:** {tp1:.2f} (+0.8%)
-**TP2:** {tp2:.2f} (+1.5%)
-**RR:** 1:2
-
-**Buy/Sell Ka Reason:**
+**Reason:**
 {reason}
 
-**News Check:** {'⚠️ News Time - Risky' if is_news_time else '✅ No News - Safe'}
-
-**Lot:** 0.01 for $50 (1% Risk)
-**Act as:** Professional London Breakout Trader
+**Chart:** Pro Candle + EMA
+**Act as:** London Breakout Trader
 """
     return buf, msg, bias
 
 async def start(update, context):
     CHAT_IDS.add(update.effective_chat.id)
-    await update.message.reply_text("V3 Lite Auto ON! ✅ Deployed fix ho gaya.\n1:30-9:30PM auto scan ON hai.\n/signal xauusd\n/status")
+    await update.message.reply_text("V4 Pro Candle ON! ✅\nCandle chart ayega\nAuto 1:30-9:30PM ON\n/signal xauusd")
 async def pairs_cmd(update, context): await update.message.reply_text("Pairs: xauusd, eurusd, gbpusd, usdjpy, gbpjpy, audusd, usdcad, us30, nas100, btc")
-async def lot_cmd(update, context): await update.message.reply_text(f"Acc $50-$100 pe 0.01 lot rakho (1% risk)")
-async def status_cmd(update, context): await update.message.reply_text(f"Time: {datetime.now().strftime('%I:%M %p IST')}\nLondon Active: {is_session()}\nAuto: ON 15min\nChats: {len(CHAT_IDS)}")
 async def sig(update, context):
     arg = (context.args[0].lower() if context.args else "xauusd")
     sym, name = PAIRS.get(arg, ("GC=F","GOLD"))
-    await update.message.reply_text(f"{name} check...")
+    await update.message.reply_text(f"{name} Pro Candle...")
     buf, msg, _ = analyse(sym, name)
     if buf: await update.message.reply_photo(photo=buf, caption=msg, parse_mode='Markdown')
     else: await update.message.reply_text("Market band")
 
-async def auto_job(context: ContextTypes.DEFAULT_TYPE):
+async def auto_job(context):
     if not is_session() or not CHAT_IDS: return
-    for key, (sym, name) in PAIRS.items():
+    for _, (sym, name) in PAIRS.items():
         try:
             buf, msg, bias = analyse(sym, name)
             if bias in ["BUY","SELL"]:
                 for cid in list(CHAT_IDS):
-                    try: await context.bot.send_photo(chat_id=cid, photo=buf, caption=f"🚨 AUTO ALERT\n{msg}", parse_mode='Markdown')
+                    try: await context.bot.send_photo(chat_id=cid, photo=buf, caption=f"🚨 AUTO {msg}", parse_mode='Markdown')
                     except: pass
         except: pass
 
@@ -141,8 +121,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signal", sig))
     app.add_handler(CommandHandler("pairs", pairs_cmd))
-    app.add_handler(CommandHandler("lot", lot_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.job_queue.run_repeating(auto_job, interval=900, first=10)
-    print("Jarvis V3 Lite Auto Started")
+    app.job_queue.run_repeating(auto_job, interval=900, first=15)
+    print("Jarvis V4 Started")
     app.run_polling()
