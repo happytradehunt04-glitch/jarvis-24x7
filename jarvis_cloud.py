@@ -1,4 +1,4 @@
-import os, threading, io, asyncio, pytz
+import os, threading, io, asyncio
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import yfinance as yf
@@ -44,11 +44,8 @@ def get_close(df):
     return c.astype(float)
 
 def is_london_session():
-    # IST me check
-    ist = pytz.timezone('Asia/Kolkata')
-    now = datetime.now(ist)
+    now = datetime.now()
     hour = now.hour + now.minute/60
-    # London: 13:30 - 17:30 IST, Overlap: 17:30 - 21:30 IST
     is_london = 13.5 <= hour <= 17.5
     is_overlap = 17.5 < hour <= 21.5
     return is_london or is_overlap, now
