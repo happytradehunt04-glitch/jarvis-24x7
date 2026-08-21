@@ -2,3 +2,5 @@ python-telegram-bot[job-queue]==21.9
 yfinance
 pandas
 matplotlib
+gspread
+google-auth
