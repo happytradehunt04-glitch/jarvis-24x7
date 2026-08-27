@@ -1,5 +1,5 @@
-import os, threading, io, json
-from datetime import datetime, timedelta
+import os, threading, io, json, asyncio
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -16,15 +16,6 @@ GOOGLE_CREDS = os.getenv("GOOGLE_CREDENTIALS")
 CHAT_IDS = set()
 TRADES = {}
 
-class H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"Jarvis V5.4 Live")
-    def do_HEAD(self): # <-- Ye naya add kiya HEAD error ke liye
-        self.send_response(200); self.end_headers()
-    def log_message(self, format, *args):
-        return # logs spam band
-# --- BUG FIX 1: Saare alias add kiye ---
 PAIRS = {
     "xauusd":("GC=F","GOLD"),"gold":("GC=F","GOLD"),"xau":("GC=F","GOLD"),
     "btcusd":("BTC-USD","BTC"),"btc":("BTC-USD","BTC"),"btc-usd":("BTC-USD","BTC"),
@@ -54,7 +45,6 @@ def get_df(sym):
     return None
 
 def is_session(name):
-    # BUG FIX 2: Crypto 24x7
     if name in CRYPTO: return True
     return 13.5 <= datetime.now().hour + datetime.now().minute/60 <= 21.5
 
@@ -135,7 +125,7 @@ async def auto_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update, context):
     CHAT_IDS.add(update.effective_chat.id)
-    await update.message.reply_text("V5.2 BugFree ON! ✅\nCrypto 24x7 ON\nBreakeven ON\n/signal btcusd | /signal xauusd | /weekly")
+    await update.message.reply_text("V5.5 BugFree ON! ✅\nCrypto 24x7 ON\nBreakeven ON\nConflict Fixed\n/signal btcusd | /signal xauusd | /weekly")
 
 async def sig(update, context):
     arg=(context.args[0].lower().replace("/","") if context.args else "xauusd")
@@ -145,7 +135,6 @@ async def sig(update, context):
     if not buf: await update.message.reply_text("Market band"); return
     entry=data["price"]; sl=entry*0.996 if bias=="BUY" else entry*1.004; tp1=entry*1.008 if bias=="BUY" else entry*0.992; tp2=entry*1.015 if bias=="BUY" else entry*0.985
     trade_id=f"{name}_{int(datetime.now().timestamp())}"
-    # Status dikhana fix kiya
     status_line = f"🟢 {bias} SIGNAL" if bias!="WAIT" else "🟡 WAIT - No Clear Trend"
     caption=f"{status_line}\n{name} | {entry:.2f}\nENTRY {entry:.2f}\nSL {sl:.2f}\nTP1 {tp1:.2f}\nTP2 {tp2:.2f}\nRR 1:2\nReason: {data['reason']}\nID: {trade_id}"
     sent=await update.message.reply_photo(photo=buf,caption=caption)
@@ -158,7 +147,7 @@ async def sig(update, context):
 
 async def weekly_cmd(update, context):
     sh=get_sheet()
-    if not sh: await update.message.reply_text(f"Local: {len(TRADES)}"); return
+    if not sh: await update.message.reply_text(f"Local trades: {len(TRADES)}"); return
     try:
         vals = sh.get_all_values()
         if len(vals) < 2: await update.message.reply_text("Sheet khali hai"); return
@@ -170,18 +159,32 @@ async def weekly_cmd(update, context):
         sl=len([r for r in data_rows if len(r)>s_idx and "SL" in r[s_idx].upper()])
         await update.message.reply_text(f"📊 Weekly\nTotal: {total}\n✅ TP1: {tp1}\n❌ SL: {sl}\nOPEN: {total-tp1-sl}")
     except Exception as e:
-        await update.message.reply_text(f"Fix header Row1: trade_id,date,pair,bias,entry,sl,tp1,tp2,status,pnl,message_id,chat_id\nError:{e}")
+        await update.message.reply_text(f"Header sahi karo: trade_id,date,pair,bias,entry,sl,tp1,tp2,status,pnl,message_id,chat_id\nError:{e}")
 
-if __name__=="__main__":
-    import asyncio
-    try: asyncio.get_event_loop()
-    except: asyncio.set_event_loop(asyncio.new_event_loop())
-    app=Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("signal",sig))
-    app.add_handler(CommandHandler("weekly",weekly_cmd))
+async def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("signal", sig))
+    app.add_handler(CommandHandler("weekly", weekly_cmd))
     app.job_queue.run_repeating(tp_checker, interval=300, first=30)
     app.job_queue.run_repeating(auto_job, interval=900, first=60)
-    print("Jarvis V5.4 Started")
-    # drop_pending_updates=True -> Conflict error khatam
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    print("Deleting webhook...")
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    print("Jarvis V5.5 Started")
+    await app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, close_loop=False)
+
+if __name__ == "__main__":
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers()
+            self.wfile.write(b"Jarvis V5.5 Live - No Conflict")
+        def do_HEAD(self):
+            self.send_response(200); self.end_headers()
+        def log_message(self, format, *args):
+            return
+    threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 10000))), H).serve_forever(), daemon=True).start()
+    try:
+        asyncio.get_event_loop()
+    except:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    asyncio.get_event_loop().run_until_complete(main())
