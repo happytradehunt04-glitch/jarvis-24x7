@@ -19,9 +19,11 @@ TRADES = {}
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers()
-        self.wfile.write(b"Jarvis V5.2 BugFree Live")
-threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT",10000))), H).serve_forever(), daemon=True).start()
-
+        self.wfile.write(b"Jarvis V5.4 Live")
+    def do_HEAD(self): # <-- Ye naya add kiya HEAD error ke liye
+        self.send_response(200); self.end_headers()
+    def log_message(self, format, *args):
+        return # logs spam band
 # --- BUG FIX 1: Saare alias add kiye ---
 PAIRS = {
     "xauusd":("GC=F","GOLD"),"gold":("GC=F","GOLD"),"xau":("GC=F","GOLD"),
@@ -175,7 +177,11 @@ if __name__=="__main__":
     try: asyncio.get_event_loop()
     except: asyncio.set_event_loop(asyncio.new_event_loop())
     app=Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",start)); app.add_handler(CommandHandler("signal",sig)); app.add_handler(CommandHandler("weekly",weekly_cmd))
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("signal",sig))
+    app.add_handler(CommandHandler("weekly",weekly_cmd))
     app.job_queue.run_repeating(tp_checker, interval=300, first=30)
     app.job_queue.run_repeating(auto_job, interval=900, first=60)
-    print("Jarvis V5.2 Started"); app.run_polling()
+    print("Jarvis V5.4 Started")
+    # drop_pending_updates=True -> Conflict error khatam
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
