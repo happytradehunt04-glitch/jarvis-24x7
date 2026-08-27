@@ -156,13 +156,19 @@ async def sig(update, context):
 
 async def weekly_cmd(update, context):
     sh=get_sheet()
-    if not sh: await update.message.reply_text(f"Local trades: {len(TRADES)}"); return
+    if not sh: await update.message.reply_text(f"Local: {len(TRADES)}"); return
     try:
-        rows=sh.get_all_records()
-        last7=[r for r in rows if "20" in str(r.get('date',''))]
-        total=len(last7); tp1=len([r for r in last7 if "TP1" in str(r['status'])]); sl=len([r for r in last7 if "SL" in str(r['status'])])
-        await update.message.reply_text(f"Weekly Report\nTotal: {total}\nTP1 Hit: {tp1} ({int(tp1/total*100) if total else 0}%)\nSL: {sl}\nOPEN: {total-tp1-sl}")
-    except Exception as e: await update.message.reply_text(f"Error {e}")
+        vals = sh.get_all_values()
+        if len(vals) < 2: await update.message.reply_text("Sheet khali hai"); return
+        header = [h.lower() for h in vals[0]]
+        s_idx = header.index("status") if "status" in header else 8
+        data_rows = vals[1:]
+        total=len(data_rows)
+        tp1=len([r for r in data_rows if len(r)>s_idx and "TP1" in r[s_idx].upper()])
+        sl=len([r for r in data_rows if len(r)>s_idx and "SL" in r[s_idx].upper()])
+        await update.message.reply_text(f"📊 Weekly\nTotal: {total}\n✅ TP1: {tp1}\n❌ SL: {sl}\nOPEN: {total-tp1-sl}")
+    except Exception as e:
+        await update.message.reply_text(f"Fix header Row1: trade_id,date,pair,bias,entry,sl,tp1,tp2,status,pnl,message_id,chat_id\nError:{e}")
 
 if __name__=="__main__":
     import asyncio
