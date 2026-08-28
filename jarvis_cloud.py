@@ -168,12 +168,13 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signal", sig))
     app.add_handler(CommandHandler("weekly", weekly_cmd))
+    
     app.job_queue.run_repeating(tp_checker, interval=300, first=30)
     app.job_queue.run_repeating(auto_job, interval=900, first=60)
-    print("Deleting webhook...")
-    await app.bot.delete_webhook(drop_pending_updates=True)
+    
     print("Jarvis V5.5 Started")
-    await app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, close_loop=False)
+    # run_polling automatic pending updates delete kar dega aur loop handle karega
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     class H(BaseHTTPRequestHandler):
@@ -182,11 +183,8 @@ if __name__ == "__main__":
             self.wfile.write(b"Jarvis V5.5 Live - No Conflict")
         def do_HEAD(self):
             self.send_response(200); self.end_headers()
-        def log_message(self, format, *args):
-            return
+        def log_message(self, format, *args): return
+        
     threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 10000))), H).serve_forever(), daemon=True).start()
-    try:
-        asyncio.get_event_loop()
-    except:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-    asyncio.get_event_loop().run_until_complete(main())
+    
+    main()
