@@ -1,3 +1,5 @@
+import nest_asyncio
+nest_asyncio.apply()
 import os, threading, io, json, asyncio
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
