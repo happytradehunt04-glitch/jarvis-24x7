@@ -1,4 +1,6 @@
 python-telegram-bot[job-queue]==21.9
-yfinance
-pandas
-matplotlib
+yfinance==0.2.38
+pandas==2.2.2
+matplotlib==3.8.4
+gspread==6.1.2
+google-auth==2.32.0
