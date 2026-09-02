@@ -1,4 +1,4 @@
-import os, threading, io, json
+import os, threading, io, json, time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
@@ -14,7 +14,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDS = os.getenv("GOOGLE_CREDENTIALS")
 CHAT_IDS = set()
-TRADES = {} # trade_id: data
+TRADES = {}
 
 PAIRS = {
     "xauusd": ("GC=F", "GOLD"), "gold": ("GC=F", "GOLD"), "xau": ("GC=F", "GOLD"),
@@ -26,33 +26,35 @@ PAIRS = {
 }
 CRYPTO = ["BTC"]
 
-# --- Google Sheet ---
 def get_sheet():
     if not SHEET_ID or not GOOGLE_CREDS: return None
     try:
         creds = json.loads(GOOGLE_CREDS)
         gc = gspread.service_account_from_dict(creds)
         sh = gc.open_by_key(SHEET_ID).sheet1
-        # Header check
         vals = sh.get_all_values()
-        if not vals or vals[0][0]!= "trade_id":
+        if not vals or vals[0][0].lower()!= "trade_id":
             sh.clear()
             sh.append_row(["trade_id","date","pair","bias","entry","sl","tp1","tp2","status","pnl","message_id","chat_id"])
         return sh
     except Exception as e:
         print(f"Sheet err {e}"); return None
 
+# ✅ FIX 1: Order change + Yahoo block fix
 def get_df(sym):
-    for per, inter in [("2d","15m"),("5d","1h"),("1mo","1d")]:
-        try:
-            df = yf.download(sym, period=per, interval=inter, progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            if len(df) > 40: return df
-        except: pass
+    for attempt in range(2):
+        for per, inter in [("1mo","1d"), ("5d","1h"), ("2d","15m")]: # Pehle Daily data lo
+            try:
+                df = yf.download(sym, period=per, interval=inter, progress=False, auto_adjust=True, threads=False)
+                if df is None or df.empty: continue
+                if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+                if len(df) > 30: return df
+            except: continue
+        time.sleep(1)
     return None
 
 def is_session(name):
-    if name in CRYPTO: return True # BTC 24x7
+    if name in CRYPTO: return True
     return 13.5 <= datetime.now().hour + datetime.now().minute/60 <= 21.5
 
 def analyse(sym, name):
@@ -73,10 +75,8 @@ def analyse(sym, name):
     ax.plot(ema50[-40:].values,color='blue',lw=0.8); ax.plot(ema200[-40:].values,color='orange',lw=0.8)
     ax.axhline(ah,color='green',ls='--',lw=0.8); ax.axhline(al,color='red',ls='--',lw=0.8)
     ax.set_title(f"{name} {price:.2f} | {bias}"); plt.tight_layout(); plt.savefig(buf,format='png',dpi=130); buf.seek(0); plt.close(fig)
-    data={"price":price,"ah":ah,"al":al,"reason":reason}
-    return buf, data, bias, df
+    return buf, {"price":price,"reason":reason}, bias, df
 
-# --- TP Checker (Har 5 min) ---
 async def tp_checker(context: ContextTypes.DEFAULT_TYPE):
     if not TRADES: return
     for tid, t in list(TRADES.items()):
@@ -84,20 +84,32 @@ async def tp_checker(context: ContextTypes.DEFAULT_TYPE):
         df=get_df(t['sym'])
         if df is None: continue
         price=float(df['Close'].iloc[-1]); sh=get_sheet()
-        hit=False; new_status=t['status']
         if t['bias']=="BUY":
-            if price>=t['tp1']: new_status="TP1_HIT"; hit=True; msg=f"✅ TP1 HIT {t['name']}\nEntry {t['entry']:.2f} -> {price:.2f}\n♻️ SL Breakeven {t['entry']:.2f} pe shift"
-            elif price<=t['sl']: new_status="SL_HIT"; hit=True; msg=f"❌ SL HIT {t['name']} {price:.2f}"
+            if price>=t['tp1']:
+                TRADES[tid]['status']="TP1_HIT"
+                try:
+                    await context.bot.send_message(chat_id=t['chat_id'], text=f"✅ TP1 HIT {t['name']}\nEntry {t['entry']:.2f} -> {price:.2f}\n♻️ Breakeven ON", reply_to_message_id=t['msg_id'])
+                    if sh: sh.update_cell(sh.find(tid).row, 9, "TP1_HIT")
+                except: pass
+            elif price<=t['sl']:
+                TRADES[tid]['status']="SL_HIT"
+                try:
+                    await context.bot.send_message(chat_id=t['chat_id'], text=f"❌ SL HIT {t['name']} {price:.2f}", reply_to_message_id=t['msg_id'])
+                    if sh: sh.update_cell(sh.find(tid).row, 9, "SL_HIT")
+                except: pass
         else:
-            if price<=t['tp1']: new_status="TP1_HIT"; hit=True; msg=f"✅ TP1 HIT {t['name']}\nEntry {t['entry']:.2f} -> {price:.2f}\n♻️ Breakeven ON"
-            elif price>=t['sl']: new_status="SL_HIT"; hit=True; msg=f"❌ SL HIT {t['name']} {price:.2f}"
-        if hit:
-            TRADES[tid]['status']=new_status
-            try:
-                await context.bot.send_message(chat_id=t['chat_id'], text=msg, reply_to_message_id=t['msg_id'])
-                if sh:
-                    cell=sh.find(tid); sh.update_cell(cell.row, 9, new_status)
-            except Exception as e: print(e)
+            if price<=t['tp1']:
+                TRADES[tid]['status']="TP1_HIT"
+                try:
+                    await context.bot.send_message(chat_id=t['chat_id'], text=f"✅ TP1 HIT {t['name']}\nEntry {t['entry']:.2f} -> {price:.2f}", reply_to_message_id=t['msg_id'])
+                    if sh: sh.update_cell(sh.find(tid).row, 9, "TP1_HIT")
+                except: pass
+            elif price>=t['sl']:
+                TRADES[tid]['status']="SL_HIT"
+                try:
+                    await context.bot.send_message(chat_id=t['chat_id'], text=f"❌ SL HIT {t['name']} {price:.2f}", reply_to_message_id=t['msg_id'])
+                    if sh: sh.update_cell(sh.find(tid).row, 9, "SL_HIT")
+                except: pass
 
 async def auto_job(context: ContextTypes.DEFAULT_TYPE):
     if not CHAT_IDS: return
@@ -111,7 +123,6 @@ async def auto_job(context: ContextTypes.DEFAULT_TYPE):
                         entry=data['price']; sl=entry*0.996 if bias=="BUY" else entry*1.004; tp1=entry*1.008 if bias=="BUY" else entry*0.992
                         buf.seek(0)
                         sent=await context.bot.send_photo(chat_id=cid, photo=buf, caption=f"🚨 AUTO {bias} {name} {entry:.2f}\nSL {sl:.2f} TP1 {tp1:.2f}\n{data['reason']}")
-                        # Save trade
                         tid=f"{name}_{int(datetime.now().timestamp())}_{cid}"
                         TRADES[tid]={"sym":sym,"name":name,"bias":bias,"entry":entry,"sl":sl,"tp1":tp1,"status":"OPEN","msg_id":sent.message_id,"chat_id":cid}
                         sh=get_sheet()
@@ -121,14 +132,15 @@ async def auto_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update, context):
     CHAT_IDS.add(update.effective_chat.id)
-    await update.message.reply_text("V6 FINAL LIVE ✅\n✅ Result Track ON\n✅ TP Hit Reply ON\n✅ Weekly Analysis ON\n✅ BTC 24x7\n\n/signal xauusd\n/signal btcusd\n/weekly\n/result")
+    await update.message.reply_text("V6.1 FIXED LIVE ✅\n✅ Result Track ON\n✅ TP Hit Reply ON\n✅ Weekly ON\n✅ Yahoo Fix ON\n\n/signal btcusd\n/signal xauusd\n/weekly")
 
 async def sig(update, context):
     arg=(context.args[0].lower() if context.args else "xauusd")
     sym,name=PAIRS.get(arg, ("GC=F","GOLD"))
     await update.message.reply_text(f"{name} checking...")
     buf,data,bias,_=analyse(sym,name)
-    if not buf: await update.message.reply_text("Market band"); return
+    if not buf:
+        await update.message.reply_text(f"{name} Data nahi mila, 1 min baad try karo."); return
     entry=data['price']; sl=entry*0.996 if bias=="BUY" else entry*1.004; tp1=entry*1.008 if bias=="BUY" else entry*0.992; tp2=entry*1.015 if bias=="BUY" else entry*0.985
     tid=f"{name}_{int(datetime.now().timestamp())}"
     caption=f"{'🟢 '+bias if bias!='WAIT' else '🟡 WAIT'} {name} {entry:.2f}\nENTRY {entry:.2f}\nSL {sl:.2f}\nTP1 {tp1:.2f}\nTP2 {tp2:.2f}\n{data['reason']}\nID:{tid}"
@@ -144,7 +156,7 @@ async def weekly_cmd(update, context):
     sh=get_sheet()
     if not sh:
         total=len(TRADES); tp=len([t for t in TRADES.values() if "TP1" in t['status']]); sl=len([t for t in TRADES.values() if "SL" in t['status']])
-        await update.message.reply_text(f"📊 Weekly (Local)\nTotal: {total}\n✅ TP: {tp}\n❌ SL: {sl}\nOPEN: {total-tp-sl}"); return
+        await update.message.reply_text(f"📊 Weekly (Local)\nTotal: {total}\n✅ TP: {tp}\n❌ SL: {sl}"); return
     try:
         vals=sh.get_all_values()
         if len(vals)<2: await update.message.reply_text("Sheet khali"); return
@@ -153,11 +165,11 @@ async def weekly_cmd(update, context):
         tp1=len([r for r in rows if len(r)>s_idx and "TP1" in r[s_idx].upper()])
         sl=len([r for r in rows if len(r)>s_idx and "SL" in r[s_idx].upper()])
         win=int(tp1/total*100) if total else 0
-        await update.message.reply_text(f"📊 WEEKLY ANALYSIS\nTotal Signals: {total}\n✅ TP Hit: {tp1} ({win}%)\n❌ SL Hit: {sl}\n🟡 Open: {total-tp1-sl}\n\nSheet me full history hai.")
+        await update.message.reply_text(f"📊 WEEKLY\nTotal: {total}\n✅ TP: {tp1} ({win}%)\n❌ SL: {sl}\n🟡 OPEN: {total-tp1-sl}")
     except Exception as e: await update.message.reply_text(f"Error {e}")
 
 class H(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Jarvis V6 Final Live")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Jarvis V6.1 Live")
     def do_HEAD(self): self.send_response(200); self.end_headers()
     def log_message(self, format, *args): return
 threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT",10000))), H).serve_forever(), daemon=True).start()
@@ -168,7 +180,7 @@ if __name__=="__main__":
     app.add_handler(CommandHandler("signal", sig))
     app.add_handler(CommandHandler("weekly", weekly_cmd))
     app.add_handler(CommandHandler("result", weekly_cmd))
-    app.job_queue.run_repeating(tp_checker, interval=300, first=30) # TP check 5 min
-    app.job_queue.run_repeating(auto_job, interval=900, first=60) # Auto signal 15 min
-    print("Jarvis V6 Final Starting")
+    app.job_queue.run_repeating(tp_checker, interval=300, first=30)
+    app.job_queue.run_repeating(auto_job, interval=900, first=60)
+    print("Jarvis V6.1 Starting")
     app.run_polling(drop_pending_updates=True)
