@@ -208,4 +208,22 @@ async def cleanup_cmd(update, context):
         await update.message.reply_text(f"✅ FINAL CLEANED: {cleaned} trades EXPIRED\nAb sirf last 30 active OPEN bache hai\nAb /weekly bhejo - OPEN 30 dikhega")
     except Exception as e:
         await update.message.reply_text(f"Cleanup error: {e}")
+        class H(BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"V7.3 Fix Live")
+    def do_HEAD(self): self.send_response(200); self.end_headers()
+    def log_message(self, format, *args): return
+threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT",10000))), H).serve_forever(), daemon=True).start()
+
+if __name__=="__main__":
+    load_chats()
+    app=Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("signal", sig))
+    app.add_handler(CommandHandler("weekly", weekly_cmd))
+    app.add_handler(CommandHandler("result", weekly_cmd))
+    app.add_handler(CommandHandler("cleanup", cleanup_cmd))
+    app.job_queue.run_repeating(auto_job, interval=600, first=30)
+    app.job_queue.run_repeating(tp_checker, interval=300, first=60)
+    print("V7.3 Starting")
+    app.run_polling(drop_pending_updates=True)
 
