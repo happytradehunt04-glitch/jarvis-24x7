@@ -168,62 +168,44 @@ async def sig(update, context):
         sh=get_sheet()
         if sh: sh.sheet1.append_row([f"{name}_{int(datetime.now().timestamp())}_{update.effective_chat.id}", datetime.now().strftime("%Y-%m-%d %H:%M"), name, bias, entry, sl, tp1, tp2, "OPEN", "", sent.message_id, update.effective_chat.id])
     except Exception as e: await update.message.reply_text(f"Error {e}")
-
-async def weekly_cmd(update, context):
+        async def weekly_cmd(update, context):
     sh=get_sheet()
     vals=sh.sheet1.get_all_values()
     if len(vals)<2: await update.message.reply_text("Sheet khali"); return
     rows=vals[1:]
-    total=len(rows); tp=len([r for r in rows if len(r)>8 and "TP" in r[8]]); sl=len([r for r in rows if len(r)>8 and "SL" in r[8]]); open_t=len([r for r in rows if len(r)>8 and r[8]=="OPEN"])
-    recent_tp=len([r for r in rows[-100:] if len(r)>8 and "TP" in r[8]])
-    await update.message.reply_text(f"📊 RESULT\nTotal All Time: {total}\n✅ TP: {tp}\n❌ SL: {sl}\n🟡 OPEN: {open_t}\n\nLast 100 me TP: {recent_tp}\n\nPurane OPEN ko /cleanup se saaf karo")
+    total=len(rows)
+    open_r=len([r for r in rows if len(r)>8 and r[8]=="OPEN"])
+    expired=len([r for r in rows if len(r)>8 and r[8]=="EXPIRED"])
+    tp=len([r for r in rows if len(r)>8 and "TP" in r[8]])
+    sl=len([r for r in rows if len(r)>8 and "SL" in r[8]])
+    # Sirf last 7 din ke active
+    await update.message.reply_text(f"📊 RESULT\nTotal All Time: {total}\n✅ TP: {tp}\n❌ SL: {sl}\n🟡 OPEN (active): {open_r}\n💤 EXPIRED (old): {expired}\n\nLast 100 me TP: {len([r for r in rows[-100:] if len(r)>8 and 'TP' in r[8]])}\n\nSheet saaf karne ke liye /cleanup 1 baar aur bhejo")
 
-# ✅ FIX: Cleanup ab 100% kaam karega
 async def cleanup_cmd(update, context):
     try:
-        await update.message.reply_text("🧹 Cleaning start... 30 sec lagega")
-        sh=get_sheet()
-        ws=sh.sheet1
+        await update.message.reply_text("🧹 Full Cleaning start... 1 min lagega, 3000 rows saaf ho rahe hai")
+        sh=get_sheet(); ws=sh.sheet1
         vals=ws.get_all_values()
-        if len(vals)<2:
-            await update.message.reply_text("Sheet khali"); return
-
-        # Sare purane OPEN ko EXPIRED banao - Batch me
-        # Header row ke baad se 3000 tak
-        to_clean = []
+        # Batch update ke liye data banao
+        updates=[]
+        cleaned=0
         for i, r in enumerate(vals[1:], start=2):
-            if len(r)>8 and r[8]=="OPEN" and i < len(vals)-50: # Last 50 chod ke sab
-                to_clean.append(i)
+            if len(r)>8 and r[8]=="OPEN":
+                # Last 30 ko chod do, baki sab EXPIRED
+                if i < len(vals)-30:
+                    updates.append({'range': f'I{i}', 'values': [['EXPIRED']]})
+                    cleaned+=1
 
-        if not to_clean:
-            await update.message.reply_text("Saaf karne ko kuch nahi, sirf last 50 OPEN hai"); return
+        if not updates:
+            await update.message.reply_text("Sab saaf hai, sirf last 30 OPEN bache hai"); return
 
-        # Google Sheet limit: ek baar me 100 hi update kar sakte hai
-        # Pehle 500 ko EXPIRED karo
-        batch = to_clean[:500]
-        for idx in batch:
-            try: ws.update_cell(idx, 9, "EXPIRED")
-            except: pass
+        # 500-500 ka batch update (fast)
+        for j in range(0, len(updates), 500):
+            batch=updates[j:j+500]
+            ws.batch_update(batch)
+            time.sleep(1)
 
-        await update.message.reply_text(f"✅ Cleaned {len(batch)} old trades to EXPIRED\nTotal OPEN bache: {len(vals)-len(batch)}\nAb /weekly bhejo")
+        await update.message.reply_text(f"✅ FINAL CLEANED: {cleaned} trades EXPIRED\nAb sirf last 30 active OPEN bache hai\nAb /weekly bhejo - OPEN 30 dikhega")
     except Exception as e:
         await update.message.reply_text(f"Cleanup error: {e}")
 
-class H(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"V7.3 Fix Live")
-    def do_HEAD(self): self.send_response(200); self.end_headers()
-    def log_message(self, format, *args): return
-threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT",10000))), H).serve_forever(), daemon=True).start()
-
-if __name__=="__main__":
-    load_chats()
-    app=Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signal", sig))
-    app.add_handler(CommandHandler("weekly", weekly_cmd))
-    app.add_handler(CommandHandler("result", weekly_cmd))
-    app.add_handler(CommandHandler("cleanup", cleanup_cmd))
-    app.job_queue.run_repeating(auto_job, interval=600, first=30)
-    app.job_queue.run_repeating(tp_checker, interval=300, first=60)
-    print("V7.3 Starting")
-    app.run_polling(drop_pending_updates=True)
