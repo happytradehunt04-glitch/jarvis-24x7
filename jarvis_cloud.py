@@ -1,7 +1,7 @@
 import os, threading, io, json, time, requests, sqlite3, logging, random, csv, asyncio
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from telegram import Update, InputFile
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import pandas as pd
 import matplotlib
@@ -91,8 +91,38 @@ def load_chats_db():
         logger.error(f"load_chats_db failed: {e}")
 
 
+# ─────────────────────── SHEET ────────────────────────────────
+def get_sheet():
+    try:
+        if not GOOGLE_CREDS:
+            logger.error("GOOGLE_CREDENTIALS missing")
+            return None
+        gc = gspread.service_account_from_dict(json.loads(GOOGLE_CREDS))
+        return gc.open_by_key(SHEET_ID)
+    except Exception as e:
+        logger.error(f"get_sheet failed: {e}")
+        return None
+
+
+def load_chats_sheet():
+    try:
+        sh = get_sheet()
+        if not sh:
+            return
+        ws = sh.worksheet("chats")
+        count = 0
+        for r in ws.get_all_values():
+            if r and r[0].isdigit():
+                CHAT_IDS.add(int(r[0]))
+                save_chat_db(int(r[0]))
+                count += 1
+        logger.info(f"Loaded {count} chats from Sheet")
+    except Exception as e:
+        logger.error(f"load_chats_sheet failed: {e}")
+
+
 def load_trades_from_sheet():
-    """✅ V10.3 FIX: Restart pe Sheet se SQLite me trades reload karo."""
+    """Restart pe Sheet se SQLite me trades reload karo."""
     try:
         sh = get_sheet()
         if not sh:
@@ -104,7 +134,7 @@ def load_trades_from_sheet():
             logger.info("Sheet has no trades to reload")
             return
 
-        rows = vals[1:]  # skip header
+        rows = vals[1:]
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         loaded = 0
@@ -130,42 +160,15 @@ def load_trades_from_sheet():
                 )
                 loaded += 1
             except Exception as e:
-                logger.warning(f"skip row {r[:2] if r else 'empty'}: {e}")
+                logger.warning(f"skip row: {e}")
                 continue
         conn.commit()
         cur.execute("SELECT COUNT(*) FROM trades")
         count = cur.fetchone()[0]
         conn.close()
-        logger.info(f"Loaded {count} trades from Sheet (scanned {loaded} rows)")
+        logger.info(f"Loaded {count} trades from Sheet")
     except Exception as e:
         logger.error(f"load_trades_from_sheet failed: {e}")
-
-
-# ─────────────────────── SHEET ────────────────────────────────
-def get_sheet():
-    try:
-        gc = gspread.service_account_from_dict(json.loads(GOOGLE_CREDS))
-        return gc.open_by_key(SHEET_ID)
-    except Exception as e:
-        logger.error(f"get_sheet failed: {e}")
-        return None
-
-
-def load_chats_sheet():
-    try:
-        sh = get_sheet()
-        if not sh:
-            return
-        ws = sh.worksheet("chats")
-        count = 0
-        for r in ws.get_all_values():
-            if r and r[0].isdigit():
-                CHAT_IDS.add(int(r[0]))
-                save_chat_db(int(r[0]))
-                count += 1
-        logger.info(f"Loaded {count} chats from Sheet")
-    except Exception as e:
-        logger.error(f"load_chats_sheet failed: {e}")
 
 
 def save_chat(cid):
@@ -317,7 +320,6 @@ def mark_sent(name, bias):
 
 
 def make_tid(name):
-    """Random suffix for zero collision."""
     return f"{name}_{int(time.time())}_{random.randint(1000, 9999)}"
 
 
@@ -455,7 +457,7 @@ async def tp_checker(context):
         conn.commit()
         conn.close()
 
-        # ✅ V10.3 FIX: Batch Sheet update (1 API call instead of N)
+        # Simple per-cell Sheet update (safer than batch)
         if updated:
             sh = get_sheet()
             if sh:
@@ -464,16 +466,14 @@ async def tp_checker(context):
                     tid_to_row = {
                         r[0]: i + 1 for i, r in enumerate(vals) if r and r[0]
                     }
-                    cells_to_update = []
                     for tid, new in updated:
                         row_idx = tid_to_row.get(tid)
                         if row_idx:
-                            cells_to_update.append(
-                                gspread.Cell(row_idx, 9, new)
-                            )
-                    if cells_to_update:
-                        sh.sheet1.update_cells(cells_to_update)
-                        logger.info(f"Sheet updated {len(cells_to_update)} cells (batch)")
+                            try:
+                                sh.sheet1.update_cell(row_idx, 9, new)
+                                await asyncio.sleep(0.5)
+                            except Exception as e:
+                                logger.error(f"Sheet update {tid}: {e}")
                 except Exception as e:
                     logger.error(f"Sheet batch update failed: {e}")
     except Exception as e:
@@ -484,7 +484,7 @@ async def tp_checker(context):
 async def start(update, context):
     save_chat(update.effective_chat.id)
     await update.message.reply_text(
-        "🤖 *JARVIS V10.3 LIVE* ✅\n\n"
+        "🤖 *JARVIS V10.4 LIVE* ✅\n\n"
         "📊 *Commands:*\n"
         "/signal btcusd | xauusd | gbpusd\n"
         "/weekly — summary\n"
@@ -501,23 +501,23 @@ async def start(update, context):
 async def help_cmd(update, context):
     await update.message.reply_text(
         "📖 *JARVIS HELP*\n\n"
-        "*Trading Commands:*\n"
-        "`/signal btcusd` — manual BTC signal\n"
+        "*Trading:*\n"
+        "`/signal btcusd` — BTC signal\n"
         "`/signal xauusd` — GOLD signal\n"
         "`/signal gbpusd` — GBPUSD signal\n\n"
-        "*Stats Commands:*\n"
+        "*Stats:*\n"
         "`/weekly` — overall result\n"
         "`/stats` — pair-wise winrate\n"
         "`/export` — CSV download\n\n"
-        "*Admin Commands:*\n"
+        "*Admin:*\n"
         "`/cleanup` — keep last 100\n\n"
-        "*Auto System:*\n"
+        "*Auto:*\n"
         "• Auto signal: every 1 hour\n"
         "• TP/SL check: every 5 min\n"
         "• 6h cooldown per pair+bias\n"
         "• BTC 24/7, Forex weekdays only\n\n"
         "*Strategy:*\n"
-        "EMA20/50 crossover + ATR-based SL/TP",
+        "EMA20/50 + ATR SL/TP",
         parse_mode="Markdown",
     )
 
@@ -596,7 +596,6 @@ async def sig(update, context):
 
 
 async def weekly_cmd(update, context):
-    """✅ V10.3 FIX: Sheet fallback wapas add kiya."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -604,9 +603,8 @@ async def weekly_cmd(update, context):
         all_r = cur.fetchall()
         conn.close()
 
-        # Agar SQLite empty, Sheet se count karo
         if not all_r:
-            logger.info("SQLite empty, falling back to Sheet")
+            logger.info("SQLite empty, trying Sheet fallback")
             sh = get_sheet()
             if sh:
                 try:
@@ -688,7 +686,6 @@ async def stats_cmd(update, context):
 
 
 async def export_cmd(update, context):
-    """✅ V10.3 FIX: InputFile use kiya."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -712,10 +709,11 @@ async def export_cmd(update, context):
         writer.writerows(rows)
 
         csv_bytes = io.BytesIO(output.getvalue().encode("utf-8"))
-        fname = f"jarvis_export_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        csv_bytes.name = f"jarvis_export_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
 
         await update.message.reply_document(
-            document=InputFile(csv_bytes, filename=fname),
+            document=csv_bytes,
+            filename=csv_bytes.name,
             caption=f"📁 Export: {len(rows)} trades",
         )
     except Exception as e:
@@ -783,8 +781,9 @@ async def cleanup_cmd(update, context):
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Jarvis V10.3 Live")
+        self.wfile.write(b"Jarvis V10.4 Live")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -794,20 +793,26 @@ class H(BaseHTTPRequestHandler):
         return
 
 
-threading.Thread(
-    target=lambda: HTTPServer(
-        ("0.0.0.0", int(os.environ.get("PORT", 10000))), H
-    ).serve_forever(),
-    daemon=True,
-).start()
+def start_health_server():
+    """✅ BUG #3 FIX: try/except me wrap."""
+    try:
+        port = int(os.environ.get("PORT", 10000))
+        server = HTTPServer(("0.0.0.0", port), H)
+        logger.info(f"Health check server on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Health server failed: {e}")
+
+
+threading.Thread(target=start_health_server, daemon=True).start()
 
 
 # ─────────────────────── MAIN ────────────────────────────────
 if __name__ == "__main__":
-    logger.info("Starting Jarvis V10.3...")
+    logger.info("Starting Jarvis V10.4...")
     init_db()
     load_chats_db()
-    load_trades_from_sheet()          # ✅ V10.3 FIX
+    load_trades_from_sheet()
     if not CHAT_IDS:
         load_chats_sheet()
 
@@ -815,18 +820,22 @@ if __name__ == "__main__":
         logger.error("BOT_TOKEN missing!")
         exit(1)
 
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("signal", sig))
-    app.add_handler(CommandHandler("weekly", weekly_cmd))
-    app.add_handler(CommandHandler("result", weekly_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("export", export_cmd))
-    app.add_handler(CommandHandler("cleanup", cleanup_cmd))
+    try:
+        app = Application.builder().token(TOKEN).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_cmd))
+        app.add_handler(CommandHandler("signal", sig))
+        app.add_handler(CommandHandler("weekly", weekly_cmd))
+        app.add_handler(CommandHandler("result", weekly_cmd))
+        app.add_handler(CommandHandler("stats", stats_cmd))
+        app.add_handler(CommandHandler("export", export_cmd))
+        app.add_handler(CommandHandler("cleanup", cleanup_cmd))
 
-    app.job_queue.run_repeating(auto_job, interval=3600, first=30)
-    app.job_queue.run_repeating(tp_checker, interval=300, first=60)
+        app.job_queue.run_repeating(auto_job, interval=3600, first=30)
+        app.job_queue.run_repeating(tp_checker, interval=300, first=60)
 
-    logger.info("Jarvis V10.3 is running ✅")
-    app.run_polling(drop_pending_updates=True)
+        logger.info("Jarvis V10.4 is running ✅")
+        app.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        raise
