@@ -1,6 +1,5 @@
-python-telegram-bot[job-queue]==21.9
-pandas==2.2.2
-matplotlib==3.8.4
-gspread==6.1.2
-google-auth==2.32.0
-requests==2.32.3
+python-telegram-bot[job-queue]
+pandas
+matplotlib
+requests
+gspread
