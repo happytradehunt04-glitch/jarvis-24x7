@@ -1,4 +1,4 @@
-import os, threading, io, json, time, requests, sqlite3, logging, random, csv
+import os, threading, io, json, time, requests, sqlite3, logging, random, csv, asyncio
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, InputFile
@@ -13,18 +13,15 @@ import gspread
 TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDS = os.getenv("GOOGLE_CREDENTIALS")
-
-# ✅ IMPROVEMENT #1: Render-friendly default path
 DB_PATH = os.getenv("DB_PATH", "/tmp/trades.db")
 
 CHAT_IDS = set()
 LAST_SIGNAL_TIME = {}
 CLEANUP_LOCK = False
 
-# Pair → (yahoo_symbol, name, min_sl_pct, min_tp_pct)
 PAIRS = {
-    "xauusd": ("GC=F",     "GOLD",   0.003, 0.005),
-    "btcusd": ("BTC-USD",  "BTC",    0.005, 0.010),
+    "xauusd": ("GC=F", "GOLD", 0.003, 0.005),
+    "btcusd": ("BTC-USD", "BTC", 0.005, 0.010),
     "gbpusd": ("GBPUSD=X", "GBPUSD", 0.003, 0.006),
 }
 
@@ -35,6 +32,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("jarvis")
+
 
 # ─────────────────────── SQLITE ───────────────────────────────
 def init_db():
@@ -50,7 +48,8 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY)
         """)
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
         logger.info(f"SQLite initialized at {DB_PATH}")
     except Exception as e:
         logger.error(f"init_db failed: {e}")
@@ -63,7 +62,8 @@ def save_to_db(trade_id, date, pair, bias, entry, sl, tp1, tp2, status, chat_id)
             "INSERT OR REPLACE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)",
             (trade_id, date, pair, bias, entry, sl, tp1, tp2, status, chat_id),
         )
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
     except Exception as e:
         logger.error(f"save_to_db failed: {e}")
 
@@ -72,7 +72,8 @@ def save_chat_db(cid):
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute("INSERT OR IGNORE INTO chats VALUES (?)", (cid,))
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
     except Exception as e:
         logger.error(f"save_chat_db failed: {e}")
 
@@ -90,6 +91,56 @@ def load_chats_db():
         logger.error(f"load_chats_db failed: {e}")
 
 
+def load_trades_from_sheet():
+    """✅ V10.3 FIX: Restart pe Sheet se SQLite me trades reload karo."""
+    try:
+        sh = get_sheet()
+        if not sh:
+            logger.warning("Sheet not available, skip trades reload")
+            return
+        ws = sh.sheet1
+        vals = ws.get_all_values()
+        if len(vals) < 2:
+            logger.info("Sheet has no trades to reload")
+            return
+
+        rows = vals[1:]  # skip header
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        loaded = 0
+        for r in rows:
+            try:
+                if len(r) < 9 or not r[0]:
+                    continue
+                tid = r[0]
+                date = r[1] if len(r) > 1 else ""
+                pair = r[2] if len(r) > 2 else ""
+                bias = r[3] if len(r) > 3 else ""
+                entry = float(r[4]) if len(r) > 4 and r[4] else 0.0
+                sl = float(r[5]) if len(r) > 5 and r[5] else 0.0
+                tp1 = float(r[6]) if len(r) > 6 and r[6] else 0.0
+                tp2 = float(r[7]) if len(r) > 7 and r[7] else 0.0
+                status = r[8] if len(r) > 8 and r[8] else "OPEN"
+                chat_id = 0
+                if len(r) > 11 and r[11] and str(r[11]).lstrip('-').isdigit():
+                    chat_id = int(r[11])
+                cur.execute(
+                    "INSERT OR IGNORE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (tid, date, pair, bias, entry, sl, tp1, tp2, status, chat_id),
+                )
+                loaded += 1
+            except Exception as e:
+                logger.warning(f"skip row {r[:2] if r else 'empty'}: {e}")
+                continue
+        conn.commit()
+        cur.execute("SELECT COUNT(*) FROM trades")
+        count = cur.fetchone()[0]
+        conn.close()
+        logger.info(f"Loaded {count} trades from Sheet (scanned {loaded} rows)")
+    except Exception as e:
+        logger.error(f"load_trades_from_sheet failed: {e}")
+
+
 # ─────────────────────── SHEET ────────────────────────────────
 def get_sheet():
     try:
@@ -103,7 +154,8 @@ def get_sheet():
 def load_chats_sheet():
     try:
         sh = get_sheet()
-        if not sh: return
+        if not sh:
+            return
         ws = sh.worksheet("chats")
         count = 0
         for r in ws.get_all_values():
@@ -117,12 +169,14 @@ def load_chats_sheet():
 
 
 def save_chat(cid):
-    if cid in CHAT_IDS: return
+    if cid in CHAT_IDS:
+        return
     CHAT_IDS.add(cid)
     save_chat_db(cid)
     try:
         sh = get_sheet()
-        if not sh: return
+        if not sh:
+            return
         ws = sh.worksheet("chats")
         existing = [r[0] for r in ws.get_all_values() if r]
         if str(cid) not in existing:
@@ -131,7 +185,7 @@ def save_chat(cid):
         logger.error(f"save_chat sheet failed: {e}")
 
 
-# ─────────────────────── DATA ─────────────────────────────────
+# ─────────────────────── DATA FETCH ──────────────────────────
 def get_df(sym):
     """BTC via Binance, baaki Yahoo. Sirf 1H."""
     if "BTC" in sym:
@@ -207,7 +261,6 @@ def analyse(sym, name, min_sl_pct, min_tp_pct):
         sl_dist = max(atr * 1.5, price * min_sl_pct)
         tp_dist = max(atr * 2.0, price * min_tp_pct)
 
-        # Chart
         d = df[-30:]
         buf = io.BytesIO()
         fig, ax = plt.subplots(figsize=(7, 3.5))
@@ -237,12 +290,16 @@ def analyse(sym, name, min_sl_pct, min_tp_pct):
 # ─────────────────────── MARKET HOURS ────────────────────────
 def is_market_open(name):
     """BTC 24/7. Forex: Sun 22 UTC - Fri 22 UTC."""
-    if name == "BTC": return True
+    if name == "BTC":
+        return True
     now = datetime.utcnow()
     wd, h = now.weekday(), now.hour
-    if wd == 5: return False              # Saturday
-    if wd == 6: return h >= 22            # Sunday
-    if wd == 4: return h < 22             # Friday
+    if wd == 5:
+        return False
+    if wd == 6:
+        return h >= 22
+    if wd == 4:
+        return h < 22
     return True
 
 
@@ -259,9 +316,8 @@ def mark_sent(name, bias):
     LAST_SIGNAL_TIME[f"{name}_{bias}"] = datetime.now()
 
 
-# ─────────────────────── ID GENERATOR ────────────────────────
 def make_tid(name):
-    """✅ IMPROVEMENT #2: random suffix for zero collision."""
+    """Random suffix for zero collision."""
     return f"{name}_{int(time.time())}_{random.randint(1000, 9999)}"
 
 
@@ -329,7 +385,7 @@ async def auto_job(context):
                             tid, date_str, name, bias,
                             entry, sl, tp1, tp2, "OPEN", "", "", 0,
                         ])
-                        time.sleep(1)  # gspread quota safe
+                        await asyncio.sleep(1)
                     except Exception as e:
                         logger.error(f"Sheet append failed: {e}")
             else:
@@ -350,7 +406,8 @@ async def tp_checker(context):
         )
         rows = cur.fetchall()
         if not rows:
-            conn.close(); return
+            conn.close()
+            return
 
         price_cache = {}
         updated = []
@@ -358,48 +415,65 @@ async def tp_checker(context):
         for tid, pair, bias, entry, sl, tp1, tp2 in rows:
             try:
                 sym = next((v[0] for k, v in PAIRS.items() if v[1] == pair), None)
-                if not sym: continue
+                if not sym:
+                    continue
                 if pair not in price_cache:
                     df = get_df(sym)
                     price_cache[pair] = (
                         float(df["Close"].iloc[-1]) if df is not None else None
                     )
                 price = price_cache[pair]
-                if price is None: continue
+                if price is None:
+                    continue
 
                 new = None
                 if bias == "BUY":
-                    if price >= tp2: new = "TP2_HIT"
-                    elif price >= tp1: new = "TP1_HIT"
-                    elif price <= sl: new = "SL_HIT"
+                    if price >= tp2:
+                        new = "TP2_HIT"
+                    elif price >= tp1:
+                        new = "TP1_HIT"
+                    elif price <= sl:
+                        new = "SL_HIT"
                 else:
-                    if price <= tp2: new = "TP2_HIT"
-                    elif price <= tp1: new = "TP1_HIT"
-                    elif price >= sl: new = "SL_HIT"
+                    if price <= tp2:
+                        new = "TP2_HIT"
+                    elif price <= tp1:
+                        new = "TP1_HIT"
+                    elif price >= sl:
+                        new = "SL_HIT"
 
                 if new:
-                    cur.execute("UPDATE trades SET status=? WHERE trade_id=?",
-                                (new, tid))
+                    cur.execute(
+                        "UPDATE trades SET status=? WHERE trade_id=?",
+                        (new, tid),
+                    )
                     updated.append((tid, new))
                     logger.info(f"Trade {tid} -> {new} @ {price:.2f}")
             except Exception as e:
                 logger.error(f"tp_checker row {tid}: {e}")
 
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
 
+        # ✅ V10.3 FIX: Batch Sheet update (1 API call instead of N)
         if updated:
             sh = get_sheet()
             if sh:
                 try:
                     vals = sh.sheet1.get_all_values()
-                    tid_to_row = {r[0]: i+1 for i, r in enumerate(vals) if r and r[0]}
+                    tid_to_row = {
+                        r[0]: i + 1 for i, r in enumerate(vals) if r and r[0]
+                    }
+                    cells_to_update = []
                     for tid, new in updated:
                         row_idx = tid_to_row.get(tid)
                         if row_idx:
-                            try:
-                                sh.sheet1.update_cell(row_idx, 9, new)
-                            except Exception as e:
-                                logger.error(f"Sheet update {tid}: {e}")
+                            cells_to_update.append(
+                                gspread.Cell(row_idx, 9, new)
+                            )
+                    if cells_to_update:
+                        sh.sheet1.update_cells(cells_to_update)
+                        logger.info(f"Sheet updated {len(cells_to_update)} cells (batch)")
                 except Exception as e:
                     logger.error(f"Sheet batch update failed: {e}")
     except Exception as e:
@@ -410,7 +484,7 @@ async def tp_checker(context):
 async def start(update, context):
     save_chat(update.effective_chat.id)
     await update.message.reply_text(
-        "🤖 *JARVIS V10.1 LIVE* ✅\n\n"
+        "🤖 *JARVIS V10.3 LIVE* ✅\n\n"
         "📊 *Commands:*\n"
         "/signal btcusd | xauusd | gbpusd\n"
         "/weekly — summary\n"
@@ -425,7 +499,6 @@ async def start(update, context):
 
 
 async def help_cmd(update, context):
-    """✅ IMPROVEMENT #4: /help command."""
     await update.message.reply_text(
         "📖 *JARVIS HELP*\n\n"
         "*Trading Commands:*\n"
@@ -444,8 +517,7 @@ async def help_cmd(update, context):
         "• 6h cooldown per pair+bias\n"
         "• BTC 24/7, Forex weekdays only\n\n"
         "*Strategy:*\n"
-        "EMA20/50 crossover + ATR-based SL/TP\n\n"
-        "*Support:* Contact admin",
+        "EMA20/50 crossover + ATR-based SL/TP",
         parse_mode="Markdown",
     )
 
@@ -476,8 +548,12 @@ async def sig(update, context):
         if bias == "WAIT":
             await update.message.reply_photo(
                 photo=buf,
-                caption=(f"⏸ WAIT {name}\nPrice: {data['price']:.2f}\n"
-                         f"ATR: {data['atr']:.2f}\nEMA gap chhota hai"),
+                caption=(
+                    f"⏸ WAIT {name}\n"
+                    f"Price: {data['price']:.2f}\n"
+                    f"ATR: {data['atr']:.2f}\n"
+                    f"EMA gap chhota hai"
+                ),
             )
             return
 
@@ -508,9 +584,10 @@ async def sig(update, context):
             try:
                 sh.sheet1.append_row([
                     tid, date_str, name, bias,
-                    entry, sl, tp1, tp2, "OPEN", "", "", update.effective_chat.id,
+                    entry, sl, tp1, tp2, "OPEN", "", "",
+                    update.effective_chat.id,
                 ])
-                time.sleep(1)
+                await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"Sheet append: {e}")
     except Exception as e:
@@ -519,11 +596,40 @@ async def sig(update, context):
 
 
 async def weekly_cmd(update, context):
+    """✅ V10.3 FIX: Sheet fallback wapas add kiya."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT status FROM trades")
-        all_r = cur.fetchall(); conn.close()
+        all_r = cur.fetchall()
+        conn.close()
+
+        # Agar SQLite empty, Sheet se count karo
+        if not all_r:
+            logger.info("SQLite empty, falling back to Sheet")
+            sh = get_sheet()
+            if sh:
+                try:
+                    vals = sh.sheet1.get_all_values()
+                    if len(vals) > 1:
+                        rows = vals[1:]
+                        total = len(rows)
+                        tp = len([r for r in rows if len(r) > 8 and "TP" in r[8]])
+                        sl = len([r for r in rows if len(r) > 8 and "SL" in r[8]])
+                        op = len([r for r in rows if len(r) > 8 and r[8] == "OPEN"])
+                        winrate = tp / (tp + sl) * 100 if (tp + sl) > 0 else 0
+                        await update.message.reply_text(
+                            f"📊 *RESULT* (Sheet fallback)\n"
+                            f"Total: {total}\n✅ TP: {tp}\n❌ SL: {sl}\n"
+                            f"🟡 OPEN: {op}\n📈 Winrate: {winrate:.1f}%",
+                            parse_mode="Markdown",
+                        )
+                        return
+                except Exception as e:
+                    logger.error(f"Sheet fallback failed: {e}")
+
+            await update.message.reply_text("📭 No trades found")
+            return
 
         total = len(all_r)
         tp = len([r for r in all_r if "TP" in r[0]])
@@ -532,8 +638,9 @@ async def weekly_cmd(update, context):
         winrate = tp / (tp + sl) * 100 if (tp + sl) > 0 else 0
 
         await update.message.reply_text(
-            f"📊 *RESULT*\nTotal: {total}\n✅ TP: {tp}\n"
-            f"❌ SL: {sl}\n🟡 OPEN: {op}\n📈 Winrate: {winrate:.1f}%",
+            f"📊 *RESULT*\n"
+            f"Total: {total}\n✅ TP: {tp}\n❌ SL: {sl}\n"
+            f"🟡 OPEN: {op}\n📈 Winrate: {winrate:.1f}%",
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -545,8 +652,12 @@ async def stats_cmd(update, context):
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT pair, status, COUNT(*) FROM trades GROUP BY pair, status")
-        data = cur.fetchall(); conn.close()
+        cur.execute(
+            "SELECT pair, status, COUNT(*) FROM trades GROUP BY pair, status"
+        )
+        data = cur.fetchall()
+        conn.close()
+
         if not data:
             await update.message.reply_text("📭 No trades yet")
             return
@@ -554,16 +665,22 @@ async def stats_cmd(update, context):
         pairs = {}
         for p, s, c in data:
             pairs.setdefault(p, {"TP": 0, "SL": 0, "OPEN": 0})
-            if "TP" in s: pairs[p]["TP"] += c
-            elif "SL" in s: pairs[p]["SL"] += c
-            else: pairs[p]["OPEN"] += c
+            if "TP" in s:
+                pairs[p]["TP"] += c
+            elif "SL" in s:
+                pairs[p]["SL"] += c
+            else:
+                pairs[p]["OPEN"] += c
 
         msg = "📈 *STATS (Pair Wise)*\n\n"
         for p, v in pairs.items():
             tot = v["TP"] + v["SL"]
             win = v["TP"] / tot * 100 if tot > 0 else 0
-            msg += (f"*{p}*\n  ✅ TP: {v['TP']}  ❌ SL: {v['SL']}  "
-                    f"🟡 OPEN: {v['OPEN']}\n  📊 Win: {win:.1f}%\n\n")
+            msg += (
+                f"*{p}*\n"
+                f"  ✅ TP: {v['TP']}  ❌ SL: {v['SL']}  🟡 OPEN: {v['OPEN']}\n"
+                f"  📊 Win: {win:.1f}%\n\n"
+            )
         await update.message.reply_text(msg, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"stats_cmd failed: {e}")
@@ -571,7 +688,7 @@ async def stats_cmd(update, context):
 
 
 async def export_cmd(update, context):
-    """✅ IMPROVEMENT #3: /export CSV download."""
+    """✅ V10.3 FIX: InputFile use kiya."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -579,25 +696,26 @@ async def export_cmd(update, context):
             "SELECT trade_id,date,pair,bias,entry,sl,tp1,tp2,status,chat_id "
             "FROM trades ORDER BY date DESC"
         )
-        rows = cur.fetchall(); conn.close()
+        rows = cur.fetchall()
+        conn.close()
 
         if not rows:
             await update.message.reply_text("📭 No trades to export")
             return
 
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(["trade_id","date","pair","bias","entry","sl",
-                         "tp1","tp2","status","chat_id"])
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "trade_id", "date", "pair", "bias",
+            "entry", "sl", "tp1", "tp2", "status", "chat_id",
+        ])
         writer.writerows(rows)
 
-        bio = io.BytesIO(buf.getvalue().encode("utf-8"))
+        csv_bytes = io.BytesIO(output.getvalue().encode("utf-8"))
         fname = f"jarvis_export_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-        bio.name = fname
 
         await update.message.reply_document(
-            document=bio,
-            filename=fname,
+            document=InputFile(csv_bytes, filename=fname),
             caption=f"📁 Export: {len(rows)} trades",
         )
     except Exception as e:
@@ -639,9 +757,9 @@ async def cleanup_cmd(update, context):
                     header = vals[0]
                     keep = vals[-100:]
                     ws.clear()
-                    time.sleep(2)
+                    await asyncio.sleep(2)
                     ws.append_row(header)
-                    time.sleep(1)
+                    await asyncio.sleep(1)
                     ws.append_rows(keep)
                     sheet_msg = f"Sheet: {sheet_before} → 100"
                 else:
@@ -664,12 +782,17 @@ async def cleanup_cmd(update, context):
 # ─────────────────────── HEALTH CHECK ────────────────────────
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"Jarvis V10.1 Live")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Jarvis V10.3 Live")
+
     def do_HEAD(self):
-        self.send_response(200); self.end_headers()
+        self.send_response(200)
+        self.end_headers()
+
     def log_message(self, format, *args):
         return
+
 
 threading.Thread(
     target=lambda: HTTPServer(
@@ -681,14 +804,16 @@ threading.Thread(
 
 # ─────────────────────── MAIN ────────────────────────────────
 if __name__ == "__main__":
-    logger.info("Starting Jarvis V10.1...")
+    logger.info("Starting Jarvis V10.3...")
     init_db()
     load_chats_db()
+    load_trades_from_sheet()          # ✅ V10.3 FIX
     if not CHAT_IDS:
         load_chats_sheet()
 
     if not TOKEN:
-        logger.error("BOT_TOKEN missing!"); exit(1)
+        logger.error("BOT_TOKEN missing!")
+        exit(1)
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -703,5 +828,5 @@ if __name__ == "__main__":
     app.job_queue.run_repeating(auto_job, interval=3600, first=30)
     app.job_queue.run_repeating(tp_checker, interval=300, first=60)
 
-    logger.info("Jarvis V10.1 is running ✅")
+    logger.info("Jarvis V10.3 is running ✅")
     app.run_polling(drop_pending_updates=True)
