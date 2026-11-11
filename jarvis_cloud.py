@@ -1,4 +1,4 @@
-"""JARVIS V12: Telegram paper-signal bot. Never places broker orders."""
+"""Jarvis V12: one shared PAPER account; no broker/order APIs exist here."""
 
 import asyncio
 import csv
@@ -10,44 +10,22 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
-from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlencode, quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-
+from telegram import Update
+from telegram.error import Forbidden, RetryAfter
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 LOG = logging.getLogger("jarvis")
-
-DB = os.getenv("DB_PATH", "data/jarvis_v12.sqlite3")
-BALANCE = float(os.getenv("ACCOUNT_SIZE", "5000"))
-
-# Percent values: 0.25 means 0.25%, not 25%.
-RISK = float(os.getenv("RISK_PCT", "0.25")) / 100
-MAX_OPEN = float(os.getenv("MAX_OPEN_RISK_PCT", "0.5")) / 100
-DAY_LIMIT = float(os.getenv("DAILY_LOSS_PCT", "1")) / 100
-DD_LIMIT = float(os.getenv("MAX_DRAWDOWN_PCT", "5")) / 100
-
-# Estimated total trading costs as a fraction of initial risk.
-# Example: 0.05 means costs of 0.05R. Adjust using broker data.
-COST_R = float(os.getenv("COST_R", "0.05"))
-
-FIRM_TZ = ZoneInfo(os.getenv("FIRM_TIMEZONE", "Europe/Prague"))
-
-ADMINS = {
-    int(x)
-    for x in os.getenv("ADMIN_USER_IDS", "").split(",")
-    if x.strip()
-}
-ALLOWED = {
-    int(x)
-    for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",")
-    if x.strip()
-}
 
 PAIRS = {
     "btcusd": "BTC-USD",
@@ -56,73 +34,103 @@ PAIRS = {
 }
 
 ACTIVE = ("PENDING", "OPEN", "PARTIAL", "REVIEW")
-LOCK = asyncio.Lock()
-HEARTBEAT = time.monotonic()
+
+T = "j12_trades"
+E = "j12_events"
+S = "j12_subscribers"
+O = "j12_outbox"
+M = "j12_meta"
 
 
-@contextmanager
-def connect():
-    db = sqlite3.connect(DB, timeout=30)
-    db.row_factory = sqlite3.Row
-    try:
-        with db:
-            yield db
-    finally:
-        db.close()
+@dataclass(frozen=True)
+class Settings:
+    token: str
+    admins: frozenset
+    chats: frozenset
+    db_path: str = "/tmp/jarvis_v12.sqlite3"
+    account: float = 5000
+    risk: float = 0.0025
+    max_open: float = 0.005
+    daily: float = 0.01
+    drawdown: float = 0.05
+    cost_r: float = 0.05
+    firm_timezone: str = "Europe/Prague"
 
+    @classmethod
+    def load(cls):
+        def ids(name):
+            values = frozenset(
+                int(x.strip())
+                for x in os.getenv(name, "").split(",")
+                if x.strip()
+            )
+            if not values:
+                raise ValueError(
+                    f"{name} must contain numeric Telegram IDs"
+                )
+            return values
 
-def init_db():
-    Path(DB).parent.mkdir(parents=True, exist_ok=True)
+        cfg = cls(
+            token=os.getenv("BOT_TOKEN", "").strip(),
+            admins=ids("ADMIN_USER_IDS"),
+            chats=ids("ALLOWED_CHAT_IDS"),
+            db_path=os.getenv(
+                "DB_PATH", "/tmp/jarvis_v12.sqlite3"
+            ),
+            account=float(os.getenv("ACCOUNT_SIZE", "5000")),
+            risk=float(os.getenv("RISK_PCT", "0.25")) / 100,
+            max_open=float(
+                os.getenv("MAX_OPEN_RISK_PCT", "0.5")
+            ) / 100,
+            daily=float(
+                os.getenv("DAILY_LOSS_PCT", "1")
+            ) / 100,
+            drawdown=float(
+                os.getenv("MAX_DRAWDOWN_PCT", "5")
+            ) / 100,
+            cost_r=float(os.getenv("COST_R", "0.05")),
+            firm_timezone=os.getenv(
+                "FIRM_TIMEZONE", "Europe/Prague"
+            ),
+        )
 
-    with connect() as db:
-        existing = {
-            row[1] for row in db.execute("PRAGMA table_info(trades)")
-        }
-        if existing and not {
-            "id", "review_from", "fill_at", "net_r"
-        } <= existing:
-            raise RuntimeError(
-                "Legacy/incompatible DB_PATH. Use a NEW "
-                "jarvis_v12.sqlite3; keep the old database as an archive."
+        numbers = (
+            cfg.account,
+            cfg.risk,
+            cfg.max_open,
+            cfg.daily,
+            cfg.drawdown,
+            cfg.cost_r,
+        )
+
+        if (
+            not cfg.token
+            or not cfg.db_path
+            or cfg.db_path == ":memory:"
+        ):
+            raise ValueError(
+                "Set BOT_TOKEN and a file-based DB_PATH"
             )
 
-        db.execute("PRAGMA journal_mode=WAL")
-        db.executescript("""
-            CREATE TABLE IF NOT EXISTS subscribers(
-                chat_id INTEGER PRIMARY KEY
-            );
+        if not all(math.isfinite(x) for x in numbers) or not (
+            cfg.account > 0
+            and 0 < cfg.risk
+            <= cfg.max_open
+            <= cfg.daily
+            <= cfg.drawdown
+            < 1
+            and cfg.cost_r >= 0
+        ):
+            raise ValueError("Invalid account/risk configuration")
 
-            CREATE TABLE IF NOT EXISTS trades(
-                id INTEGER PRIMARY KEY,
-                pair TEXT NOT NULL,
-                candle INTEGER NOT NULL,
-                created INTEGER NOT NULL,
-                fill_at INTEGER NOT NULL,
-                checked INTEGER NOT NULL,
-                side INTEGER NOT NULL,
-                reference REAL NOT NULL,
-                distance REAL NOT NULL,
-                entry REAL,
-                sl REAL,
-                tp1 REAL,
-                tp2 REAL,
-                risk REAL NOT NULL,
-                status TEXT NOT NULL,
-                closed INTEGER,
-                net_r REAL,
-                review_from TEXT,
-                archived INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(pair, candle)
-            );
-        """)
+        if any(x <= 0 for x in cfg.admins) or 0 in cfg.chats:
+            raise ValueError(
+                "Admin user IDs must be positive; "
+                "chat IDs cannot be zero"
+            )
 
-
-def all_trades():
-    with connect() as db:
-        return [
-            dict(row)
-            for row in db.execute("SELECT * FROM trades ORDER BY id")
-        ]
+        ZoneInfo(cfg.firm_timezone)
+        return cfg
 
 
 def market_open(pair, ts):
@@ -140,7 +148,7 @@ def market_open(pair, ts):
     )
 
 
-def session_open(pair, ts):
+def in_session(pair, ts):
     if pair == "btcusd":
         return True
 
@@ -160,133 +168,213 @@ def session_open(pair, ts):
     )
 
 
-def request_json(url):
+def json_get(url):
     request = Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers={
+            "User-Agent": "JarvisPaper/12.0",
+            "Accept": "application/json",
+        },
     )
-    with urlopen(request, timeout=20) as response:
-        return json.load(response)
+
+    with urlopen(request, timeout=15) as response:
+        body = response.read(8_000_001)
+
+    if len(body) > 8_000_000:
+        raise ValueError("Market-data response too large")
+
+    return json.loads(body)
 
 
-def get_frame(pair, minutes, now=None):
-    """UTC epoch index; completed candles only."""
-    now = int(time.time() if now is None else now)
-    symbol = PAIRS[pair]
-    interval = "1h" if minutes == 60 else "5m"
+def normalize(frame, seconds, now):
+    if frame.empty:
+        return pd.DataFrame(
+            columns=["Open", "High", "Low", "Close"]
+        )
+
+    frame = frame.copy()
+    index = pd.to_numeric(frame.index, errors="raise")
+
+    if any(
+        not math.isfinite(float(x))
+        or float(x) != int(x)
+        or int(x) < 0
+        for x in index
+    ):
+        raise ValueError("Invalid candle timestamp")
+
+    frame.index = index.astype("int64")
+
+    # Exclude forming/future candles before validating unfinished OHLC.
+    frame = frame.loc[
+        frame.index + seconds <= now
+    ].sort_index()
+
+    if (
+        frame.index.has_duplicates
+        or any(int(x) % seconds for x in frame.index)
+    ):
+        raise ValueError(
+            "Duplicate or misaligned candle timestamp"
+        )
+
+    frame = frame[
+        ["Open", "High", "Low", "Close"]
+    ].apply(pd.to_numeric, errors="coerce")
+
+    finite = (
+        frame.notna().all(axis=1)
+        & ~frame.isin([math.inf, -math.inf]).any(axis=1)
+    )
+
+    valid = finite & (frame > 0).all(axis=1)
+    valid &= (
+        frame.High
+        >= frame[["Open", "Low", "Close"]].max(axis=1)
+    )
+    valid &= (
+        frame.Low
+        <= frame[["Open", "High", "Close"]].min(axis=1)
+    )
+
+    if not valid.all():
+        raise ValueError(
+            "Rejected invalid/nonfinite completed OHLC"
+        )
+
+    return frame
+
+
+def fetch(pair, minutes, now, since=None):
+    """Coinbase catch-up uses one bounded window per cycle."""
+    seconds = minutes * 60
 
     if pair == "btcusd":
-        query = urlencode({"granularity": minutes * 60})
-        raw = request_json(
-            "https://api.exchange.coinbase.com/products/"
-            "BTC-USD/candles?" + query
-        )
-        if not isinstance(raw, list):
-            raise ValueError("Coinbase returned an error")
+        query = {"granularity": seconds}
 
-        # Coinbase: timestamp, low, high, open, close, volume.
-        rows = [
-            (
-                int(row[0]),
-                float(row[3]),
-                float(row[2]),
-                float(row[1]),
-                float(row[4]),
+        if since is not None:
+            if since + seconds > now:
+                return normalize(
+                    pd.DataFrame(), seconds, now
+                )
+
+            query.update(
+                start=datetime.fromtimestamp(
+                    since, timezone.utc
+                ).isoformat(),
+                end=datetime.fromtimestamp(
+                    min(now, since + 299 * seconds),
+                    timezone.utc,
+                ).isoformat(),
             )
-            for row in raw
-        ]
+
+        raw = json_get(
+            "https://api.exchange.coinbase.com/products/"
+            "BTC-USD/candles?"
+            + urlencode(query)
+        )
+
+        if not isinstance(raw, list):
+            raise ValueError("Coinbase data error")
+
+        # Coinbase: time, low, high, open, close, volume.
         frame = pd.DataFrame(
-            rows,
+            [
+                (row[0], row[3], row[2], row[1], row[4])
+                for row in raw
+            ],
             columns=["ts", "Open", "High", "Low", "Close"],
         ).set_index("ts")
 
     else:
         query = urlencode({
             "range": "3mo" if minutes == 60 else "1mo",
-            "interval": interval,
+            "interval": "1h" if minutes == 60 else "5m",
         })
-        raw = request_json(
+
+        raw = json_get(
             "https://query1.finance.yahoo.com/v8/finance/chart/"
-            + quote(symbol, safe="")
+            + quote(PAIRS[pair], safe="")
             + "?"
             + query
         )
-        if raw["chart"].get("error"):
-            raise ValueError("Yahoo returned an error")
+
+        if (
+            raw["chart"].get("error")
+            or not raw["chart"].get("result")
+        ):
+            raise ValueError("Yahoo data error")
 
         result = raw["chart"]["result"][0]
+
         frame = pd.DataFrame(
             result["indicators"]["quote"][0],
             index=result["timestamp"],
-        )
-        frame = frame.rename(columns=str.title)[
-            ["Open", "High", "Low", "Close"]
+        ).rename(columns=str.title)
+
+        # All-null Yahoo rows mean "no quote".
+        # Preserve the gap; never fill it with an invented price.
+        frame = frame.loc[
+            ~frame[
+                ["Open", "High", "Low", "Close"]
+            ].isna().all(axis=1)
         ]
 
-    frame = (
-        frame.apply(pd.to_numeric, errors="coerce")
-        .dropna()
-        .sort_index()
-    )
+    frame = normalize(frame, seconds, now)
 
-    if frame.index.has_duplicates:
-        raise ValueError("Duplicate candle timestamps")
-
-    frame = frame.loc[
-        frame.index + minutes * 60 <= now
-    ]
-    if frame.empty:
-        raise ValueError("No completed candles")
-
-    valid = (
-        (frame > 0).all(axis=1)
-        & (
-            frame.High
-            >= frame[["Open", "Close", "Low"]].max(axis=1)
-        )
-        & (
-            frame.Low
-            <= frame[["Open", "Close", "High"]].min(axis=1)
-        )
-    )
-    infinite = frame.isin([
-        float("inf"), float("-inf")
-    ]).any().any()
-
-    if not valid.all() or infinite:
-        raise ValueError("Invalid OHLC data")
+    if since is not None:
+        frame = frame.loc[frame.index >= since]
 
     return frame
 
 
-def analyse(frame, now):
-    # Only act within 10 minutes of the latest hourly close.
-    if len(frame) < 200:
-        return None
+def wilder_last(values, period=14):
+    values = list(values)
+    result = sum(values[:period]) / period
 
-    age = now - (int(frame.index[-1]) + 3600)
-    if not 0 <= age <= 600:
-        return None
+    for value in values[period:]:
+        result = (
+            result * (period - 1) + value
+        ) / period
+
+    return result
+
+
+def signal_check(pair, now):
+    frame = fetch(pair, 60, now)
+
+    if len(frame) < 200:
+        return (
+            frame,
+            None,
+            "WAIT: fewer than 200 completed hourly candles.",
+        )
+
+    candle = int(frame.index[-1])
+
+    if not 0 <= now - (candle + 3600) < 600:
+        return (
+            frame,
+            None,
+            "WAIT: outside the first 10 minutes "
+            "after a fresh hourly close.",
+        )
+
+    if not in_session(pair, now):
+        return frame, None, "WAIT: outside the trading session."
 
     close = frame.Close
-    e20 = close.ewm(
-        span=20, adjust=False
-    ).mean().iloc[-1]
-    e50 = close.ewm(
-        span=50, adjust=False
-    ).mean().iloc[-1]
 
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(
-        alpha=1 / 14,
-        adjust=False,
-        min_periods=14,
-    ).mean().iloc[-1]
-    loss = (-delta.clip(upper=0)).ewm(
-        alpha=1 / 14,
-        adjust=False,
-        min_periods=14,
-    ).mean().iloc[-1]
+    e20 = float(
+        close.ewm(span=20, adjust=False).mean().iloc[-1]
+    )
+    e50 = float(
+        close.ewm(span=50, adjust=False).mean().iloc[-1]
+    )
+
+    change = close.diff().dropna()
+    gain = wilder_last(change.clip(lower=0))
+    loss = wilder_last(-change.clip(upper=0))
 
     if gain == loss == 0:
         rsi = 50
@@ -295,28 +383,17 @@ def analyse(frame, now):
     else:
         rsi = 100 - 100 / (1 + gain / loss)
 
-    tr = pd.concat([
-        frame.High - frame.Low,
-        (frame.High - close.shift()).abs(),
-        (frame.Low - close.shift()).abs(),
-    ], axis=1).max(axis=1)
+    true_range = pd.concat(
+        [
+            frame.High - frame.Low,
+            (frame.High - close.shift()).abs(),
+            (frame.Low - close.shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
-    atr = tr.ewm(
-        alpha=1 / 14,
-        adjust=False,
-        min_periods=14,
-    ).mean().iloc[-1]
-
+    atr = wilder_last(true_range)
     price = float(close.iloc[-1])
-
-    if not all(
-        math.isfinite(value)
-        for value in [price, atr, rsi, e20, e50]
-    ):
-        return None
-
-    if atr <= 0 or abs(e20 - e50) / price < 0.0012:
-        return None
 
     side = 0
     if e20 > e50 and 55 < rsi < 70:
@@ -324,363 +401,888 @@ def analyse(frame, now):
     elif e20 < e50 and 30 < rsi < 45:
         side = -1
 
-    if not side:
-        return None
-
-    return side, price, float(1.5 * atr), float(rsi)
-
-
-def reserve(pair, candle, now, setup):
-    """Shared paper account; manual requests use the same risk gate."""
-    side, reference, distance, _ = setup
-    day = datetime.fromtimestamp(now, FIRM_TZ).date()
-
-    with connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        rows = [
-            dict(row)
-            for row in db.execute("SELECT * FROM trades")
-        ]
-
-        if any(
-            trade["pair"] == pair
-            and (
-                trade["status"] in ACTIVE
-                or trade["created"] > now - 21600
-            )
-            for trade in rows
-        ):
-            return None
-
-        if any(
-            trade["pair"] == pair
-            and trade["candle"] == candle
-            for trade in rows
-        ):
-            return None
-
-        if any(
-            trade["status"] == "REVIEW"
-            for trade in rows
-        ):
-            return None
-
-        equity = BALANCE + sum(
-            trade["risk"] * trade["net_r"]
-            for trade in rows
-            if trade["net_r"] is not None
+    if (
+        not all(
+            math.isfinite(x)
+            for x in (price, atr, rsi, e20, e50)
+        )
+        or atr <= 0
+        or abs(e20 - e50) / price < 0.0012
+        or not side
+    ):
+        return (
+            frame,
+            None,
+            f"WAIT: EMA/RSI/ATR filter; RSI {rsi:.1f}.",
         )
 
-        risk = min(BALANCE, equity) * RISK
+    setup = {
+        "pair": pair,
+        "candle": candle,
+        "side": side,
+        "reference": price,
+        "distance": 1.5 * atr,
+        "rsi": rsi,
+    }
 
-        reserved = sum(
-            trade["risk"] * (1 + COST_R)
-            for trade in rows
-            if trade["status"] in ACTIVE
-        )
-
-        daily_losses = sum(
-            max(0, -trade["risk"] * trade["net_r"])
-            for trade in rows
-            if trade["closed"]
-            and trade["net_r"] is not None
-            and datetime.fromtimestamp(
-                trade["closed"], FIRM_TZ
-            ).date() == day
-        )
-
-        worst = reserved + risk * (1 + COST_R)
-
-        if (
-            risk <= 0
-            or worst > BALANCE * MAX_OPEN
-            or daily_losses + worst > BALANCE * DAY_LIMIT
-            or equity - worst < BALANCE * (1 - DD_LIMIT)
-        ):
-            return None
-
-        fill_at = (now // 300 + 1) * 300
-
-        cursor = db.execute("""
-            INSERT INTO trades(
-                pair, candle, created, fill_at, checked,
-                side, reference, distance, risk, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            pair,
-            candle,
-            now,
-            fill_at,
-            fill_at - 300,
-            side,
-            reference,
-            distance,
-            risk,
-            "PENDING",
-        ))
-        return cursor.lastrowid
+    return frame, setup, "Qualified paper setup."
 
 
-def finish(trade, status, ts, gross_r):
-    trade.update(
-        status=status,
-        closed=ts,
-        net_r=gross_r - COST_R,
-    )
-
-
-def process_bar(trade, ts, bar):
+def advance(trade, ts, bar):
     """
-    Exit 50% at 1R and 50% at 2R.
-    Retain the original stop.
-    Use stop-first when intrabar ordering is unknown.
+    Pure state transition.
+
+    Returns accounting events:
+        (timestamp, event_kind, delta_R)
+
+    Original stop is retained after TP1.
     """
     t = trade
-    side = t["side"]
+    events = []
 
     if t["status"] == "PENDING":
-        excessive_gap = (
-            abs(bar.Open - t["reference"])
-            > t["distance"] * 0.25
+        invalid_entry = (
+            ts != t["fill_at"]
+            or not in_session(t["pair"], ts)
+            or abs(bar.Open - t["reference"])
+            > 0.25 * t["distance"]
         )
-        if ts != t["fill_at"] or excessive_gap:
-            t.update(status="CANCELLED", closed=ts)
-            return
 
-        t.update(status="OPEN", entry=float(bar.Open))
+        if invalid_entry:
+            t.update(
+                status="CANCELLED",
+                closed=ts,
+                reason="Unverifiable/session/gapped entry",
+            )
+            return events
+
         t.update(
-            sl=t["entry"] - side * t["distance"],
-            tp1=t["entry"] + side * t["distance"],
-            tp2=t["entry"] + side * 2 * t["distance"],
+            status="OPEN",
+            entry=float(bar.Open),
+            remaining=1.0,
+        )
+        t.update(
+            sl=t["entry"] - t["side"] * t["distance"],
+            tp1=t["entry"] + t["side"] * t["distance"],
+            tp2=t["entry"] + 2 * t["side"] * t["distance"],
         )
 
-    if t["status"] not in ("OPEN", "PARTIAL"):
-        return
+        # Charge estimated full-trade costs once, at entry.
+        events.append((ts, "COST", -t["cost_r"]))
 
-    # Opening prices have a known ordering.
-    if side * (bar.Open - t["tp2"]) >= 0:
-        finish(t, "CLOSED", ts, 1.5)
-        t["checked"] = ts
-        return
-
-    if side * (bar.Open - t["tp1"]) >= 0:
-        t["status"] = "PARTIAL"
-
-    partial = t["status"] == "PARTIAL"
+    side = t["side"]
 
     stop_hit = (
         bar.Low <= t["sl"]
         if side == 1
         else bar.High >= t["sl"]
     )
-
-    if stop_hit:
-        # An adverse opening gap can lose more than 1R.
-        fill = (
-            min(t["sl"], bar.Open)
-            if side == 1
-            else max(t["sl"], bar.Open)
-        )
-        stop_r = (
-            side * (fill - t["entry"]) / t["distance"]
-        )
-        gross_r = (
-            0.5 + 0.5 * stop_r
-            if partial
-            else stop_r
-        )
-        finish(t, "CLOSED", ts + 300, gross_r)
-
-    else:
-        hit1 = (
-            bar.High >= t["tp1"]
-            if side == 1
-            else bar.Low <= t["tp1"]
-        )
-        hit2 = (
-            bar.High >= t["tp2"]
-            if side == 1
-            else bar.Low <= t["tp2"]
-        )
-
-        if hit2:
-            finish(t, "CLOSED", ts + 300, 1.5)
-        elif hit1:
-            t["status"] = "PARTIAL"
-
-    t["checked"] = ts
-
-
-def update_trade(trade):
-    columns = [
-        "entry", "sl", "tp1", "tp2", "status",
-        "closed", "net_r", "checked", "review_from",
-    ]
-    assignments = ",".join(
-        column + "=?" for column in columns
+    hit1 = (
+        bar.High >= t["tp1"]
+        if side == 1
+        else bar.Low <= t["tp1"]
+    )
+    hit2 = (
+        bar.High >= t["tp2"]
+        if side == 1
+        else bar.Low <= t["tp2"]
     )
 
-    with connect() as db:
-        db.execute(
-            "UPDATE trades SET "
-            + assignments
-            + " WHERE id=?",
-            [trade.get(column) for column in columns]
-            + [trade["id"]],
+    # Strict stop-first whenever both SL and a target are touched.
+    if stop_hit:
+        fill = (
+            min(bar.Open, t["sl"])
+            if side == 1
+            else max(bar.Open, t["sl"])
         )
 
+        delta = (
+            t["remaining"]
+            * side
+            * (fill - t["entry"])
+            / t["distance"]
+        )
 
-def track(pair, frame, now):
-    events = []
+        events.append((ts + 300, "SL", delta))
+        t["gross_r"] += delta
 
-    for trade in all_trades():
-        if (
-            trade["pair"] != pair
-            or trade["status"] not in ACTIVE
-        ):
-            continue
+        t.update(
+            status="CLOSED",
+            remaining=0.0,
+            closed=ts + 300,
+            reason="SL",
+        )
 
-        old_status = trade["status"]
-        bars = frame.loc[
-            frame.index > trade["checked"]
-        ]
+    else:
+        if hit1 and t["status"] == "OPEN":
+            t.update(status="PARTIAL", remaining=0.5)
+            t["gross_r"] += 0.5
+            events.append((ts + 300, "TP1", 0.5))
 
-        if old_status == "REVIEW":
-            if bars.empty:
-                continue
-            trade["status"] = trade["review_from"]
+        if hit2:
+            delta = t["remaining"] * 2
+            t["gross_r"] += delta
 
-        for timestamp, bar in bars.iterrows():
-            ts = int(timestamp)
+            events.append((ts + 300, "TP2", delta))
 
-            missing = range(
-                trade["checked"] + 300,
-                ts,
-                300,
+            t.update(
+                status="CLOSED",
+                remaining=0.0,
+                closed=ts + 300,
+                reason="TP2",
             )
 
-            if (
-                trade["status"] != "PENDING"
-                and any(
-                    market_open(pair, stamp)
-                    for stamp in missing
-                )
-            ):
-                trade["review_from"] = trade["status"]
-                trade["status"] = "REVIEW"
-                break
+    t.update(
+        checked=ts,
+        mark=float(bar.Close),
+        mark_ts=ts + 300,
+    )
 
-            process_bar(trade, ts, bar)
-
-            if trade["status"] not in ("OPEN", "PARTIAL"):
-                break
-
-        if (
-            trade["status"] == "PENDING"
-            and now > trade["fill_at"] + 3600
-        ):
-            trade.update(
-                status="CANCELLED",
-                closed=now,
-            )
-
-        update_trade(trade)
-
-        if trade["status"] != old_status:
-            text = (
-                f"Paper #{trade['id']} {pair.upper()}: "
-                f"{trade['status']}"
-            )
-            if trade["entry"] is not None:
-                text += (
-                    f" | entry {trade['entry']:.5f}"
-                    f", SL {trade['sl']:.5f}"
-                    f", TP1 {trade['tp1']:.5f}"
-                    f", TP2 {trade['tp2']:.5f}"
-                    f", risk ${trade['risk']:.2f}"
-                )
-            if trade["net_r"] is not None:
-                text += f" | net {trade['net_r']:.2f}R"
-
-            events.append(text)
+    if t["status"] == "CLOSED":
+        t["net_r"] = t["gross_r"] - t["cost_r"]
 
     return events
 
 
-def report(days=None):
-    now = int(time.time())
-    rows = [
-        trade
-        for trade in all_trades()
-        if days is None
-        or (
-            trade["closed"] or trade["created"]
-        ) >= now - days * 86400
-    ]
+class Store:
+    """Public methods run through asyncio.to_thread."""
 
-    lines = [
-        "PAPER estimates; assumed costs, no broker fills."
-    ]
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.tz = ZoneInfo(cfg.firm_timezone)
 
-    for pair in PAIRS:
-        group = [
-            trade for trade in rows
-            if trade["pair"] == pair
+    @contextmanager
+    def db(self):
+        db = sqlite3.connect(
+            self.cfg.db_path,
+            timeout=10,
+        )
+        db.row_factory = sqlite3.Row
+
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
+
+    def initialize(self):
+        Path(self.cfg.db_path).parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with self.db() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+
+            # Namespaced tables preserve existing V11/V12 tables.
+            # Incompatible legacy accounting is not silently imported.
+            db.executescript(f"""
+                CREATE TABLE IF NOT EXISTS {M}(
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS {S}(
+                    chat_id INTEGER PRIMARY KEY
+                );
+
+                CREATE TABLE IF NOT EXISTS {T}(
+                    id INTEGER PRIMARY KEY,
+                    pair TEXT NOT NULL,
+                    candle INTEGER NOT NULL,
+                    created INTEGER NOT NULL,
+                    fill_at INTEGER NOT NULL,
+                    checked INTEGER NOT NULL,
+                    side INTEGER NOT NULL,
+                    reference REAL NOT NULL,
+                    distance REAL NOT NULL,
+                    risk REAL NOT NULL,
+                    cost_r REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    review_from TEXT,
+                    entry REAL,
+                    sl REAL,
+                    tp1 REAL,
+                    tp2 REAL,
+                    remaining REAL NOT NULL DEFAULT 1,
+                    gross_r REAL NOT NULL DEFAULT 0,
+                    mark REAL,
+                    mark_ts INTEGER,
+                    closed INTEGER,
+                    net_r REAL,
+                    reason TEXT,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(pair, candle)
+                );
+
+                CREATE TABLE IF NOT EXISTS {E}(
+                    id INTEGER PRIMARY KEY,
+                    trade_id INTEGER NOT NULL,
+                    ts INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    pnl REAL NOT NULL,
+                    UNIQUE(trade_id, ts, kind)
+                );
+
+                CREATE TABLE IF NOT EXISTS {O}(
+                    id INTEGER PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    created INTEGER NOT NULL,
+                    delivered INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_try INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS j12_status_idx
+                    ON {T}(status);
+
+                CREATE INDEX IF NOT EXISTS j12_event_time_idx
+                    ON {E}(ts);
+            """)
+
+            fresh = not db.execute(
+                f"SELECT 1 FROM {M} "
+                "WHERE key='initial_balance'"
+            ).fetchone()
+
+            if fresh:
+                legacy = db.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type='table' AND name='trades'"
+                ).fetchone()[0]
+
+                db.executemany(
+                    f"INSERT INTO {M} VALUES (?, ?)",
+                    [
+                        ("initial_balance", str(self.cfg.account)),
+                        ("ledger_id", uuid.uuid4().hex[:12]),
+                        ("created", str(int(time.time()))),
+                        ("legacy_preserved", str(legacy)),
+                    ],
+                )
+
+            balance = float(
+                db.execute(
+                    f"SELECT value FROM {M} "
+                    "WHERE key='initial_balance'"
+                ).fetchone()[0]
+            )
+            ledger = db.execute(
+                f"SELECT value FROM {M} "
+                "WHERE key='ledger_id'"
+            ).fetchone()[0]
+            legacy = db.execute(
+                f"SELECT value FROM {M} "
+                "WHERE key='legacy_preserved'"
+            ).fetchone()[0]
+
+        LOG.info(
+            "Ledger %s initialized; balance %.2f; "
+            "legacy preserved=%s",
+            ledger,
+            balance,
+            legacy,
+        )
+
+        if balance != self.cfg.account:
+            LOG.warning(
+                "ACCOUNT_SIZE differs from existing ledger; "
+                "using stored initial balance %.2f",
+                balance,
+            )
+
+        return ledger
+
+    def notify(self, db, text, now, extra=None):
+        chats = {
+            row[0]
+            for row in db.execute(
+                f"SELECT chat_id FROM {S}"
+            )
+        } & self.cfg.chats
+
+        if extra in self.cfg.chats:
+            chats.add(extra)
+
+        db.executemany(
+            f"INSERT INTO {O}(chat_id, text, created) "
+            "VALUES (?, ?, ?)",
+            [(chat_id, text, now) for chat_id in chats],
+        )
+
+    def subscribe(self, chat_id, enabled):
+        with self.db() as db:
+            if enabled:
+                db.execute(
+                    f"INSERT OR IGNORE INTO {S} VALUES (?)",
+                    (chat_id,),
+                )
+            else:
+                db.execute(
+                    f"DELETE FROM {S} WHERE chat_id=?",
+                    (chat_id,),
+                )
+                db.execute(
+                    f"DELETE FROM {O} "
+                    "WHERE chat_id=? AND delivered IS NULL",
+                    (chat_id,),
+                )
+
+    def active(self):
+        with self.db() as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    f"SELECT * FROM {T} WHERE status IN "
+                    "('PENDING','OPEN','PARTIAL','REVIEW')"
+                )
+            ]
+
+    def subscribed(self):
+        with self.db() as db:
+            return any(
+                row[0] in self.cfg.chats
+                for row in db.execute(
+                    f"SELECT chat_id FROM {S}"
+                )
+            )
+
+    def reserve(self, setup, now, requester=None):
+        pair = setup["pair"]
+
+        levels = (
+            setup["reference"]
+            - setup["side"] * setup["distance"],
+            setup["reference"]
+            + 2 * setup["side"] * setup["distance"],
+        )
+
+        if (
+            setup["distance"] <= 0
+            or any(
+                not math.isfinite(x) or x <= 0
+                for x in levels
+            )
+        ):
+            return "WAIT: invalid projected price levels."
+
+        if (
+            not in_session(pair, now)
+            or not 0 <= now - setup["candle"] - 3600 < 600
+        ):
+            return "WAIT: setup/session expired during processing."
+
+        fill_at = (now // 300 + 1) * 300
+
+        if not in_session(pair, fill_at):
+            return "WAIT: next model entry is outside session."
+
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+
+            active = [
+                dict(row)
+                for row in db.execute(
+                    f"SELECT * FROM {T} WHERE status IN "
+                    "('PENDING','OPEN','PARTIAL','REVIEW')"
+                )
+            ]
+
+            if any(
+                trade["status"] == "REVIEW"
+                for trade in active
+            ):
+                return "Paused: unresolved REVIEW trade."
+
+            if any(
+                trade["pair"] == pair
+                for trade in active
+            ):
+                return "Existing active paper trade for this pair."
+
+            duplicate = db.execute(
+                f"SELECT 1 FROM {T} "
+                "WHERE pair=? AND (candle=? OR created>?)",
+                (pair, setup["candle"], now - 21600),
+            ).fetchone()
+
+            if duplicate:
+                return (
+                    "Duplicate/cooldown: already processed; "
+                    "cooldown is six hours."
+                )
+
+            base = float(
+                db.execute(
+                    f"SELECT value FROM {M} "
+                    "WHERE key='initial_balance'"
+                ).fetchone()[0]
+            )
+
+            cash = base + db.execute(
+                f"SELECT COALESCE(SUM(pnl),0) FROM {E}"
+            ).fetchone()[0]
+
+            day_start = datetime.fromtimestamp(
+                now, self.tz
+            ).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            ).timestamp()
+
+            losses = -db.execute(
+                f"SELECT COALESCE(SUM(pnl),0) FROM {E} "
+                "WHERE ts>=? AND pnl<0",
+                (day_start,),
+            ).fetchone()[0]
+
+            exposure = sum(
+                trade["risk"] * (1 + trade["cost_r"])
+                if trade["status"] == "PENDING"
+                else trade["risk"] * trade["remaining"]
+                for trade in active
+            )
+
+            risk = min(base, cash) * self.cfg.risk
+            worst = exposure + risk * (1 + self.cfg.cost_r)
+
+            if (
+                risk <= 0
+                or worst > base * self.cfg.max_open + 1e-9
+                or losses + worst > base * self.cfg.daily + 1e-9
+                or cash - worst
+                < base * (1 - self.cfg.drawdown) - 1e-9
+            ):
+                return (
+                    "Blocked by open-risk, daily-loss or "
+                    "fixed-initial drawdown limit."
+                )
+
+            cursor = db.execute(
+                f"""
+                    INSERT INTO {T}(
+                        pair, candle, created, fill_at, checked,
+                        side, reference, distance, risk,
+                        cost_r, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pair,
+                    setup["candle"],
+                    now,
+                    fill_at,
+                    fill_at - 300,
+                    setup["side"],
+                    setup["reference"],
+                    setup["distance"],
+                    risk,
+                    self.cfg.cost_r,
+                    "PENDING",
+                ),
+            )
+
+            text = (
+                f"PAPER #{cursor.lastrowid} "
+                f"{'BUY' if setup['side'] == 1 else 'SELL'} "
+                f"{pair.upper()}\n"
+                f"Reference {setup['reference']:.5f}; "
+                f"SL distance {setup['distance']:.5f}; "
+                f"RSI {setup['rsi']:.1f}\n"
+                f"Risk ${risk:.2f} + "
+                f"{self.cfg.cost_r:.2f}R costs. "
+                "Pending next 5m open.\n"
+                "50% at 1R; 50% at 2R; "
+                "original stop retained. No broker order."
+            )
+
+            self.notify(db, text, now, requester)
+            return text
+
+    def track(self, pair, frame, now):
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+
+            trades = [
+                dict(row)
+                for row in db.execute(
+                    f"SELECT * FROM {T} WHERE pair=? "
+                    "AND status IN "
+                    "('PENDING','OPEN','PARTIAL','REVIEW')",
+                    (pair,),
+                )
+            ]
+
+            for trade in trades:
+                old_status = trade["status"]
+
+                bars = frame.loc[
+                    frame.index > trade["checked"]
+                ]
+
+                if old_status == "REVIEW":
+                    if bars.empty:
+                        continue
+                    trade["status"] = trade["review_from"]
+                    trade["reason"] = None
+
+                for index, bar in bars.iterrows():
+                    ts = int(index)
+
+                    missing = range(
+                        trade["checked"] + 300,
+                        ts,
+                        300,
+                    )
+
+                    if (
+                        trade["status"] != "PENDING"
+                        and any(
+                            market_open(pair, stamp)
+                            for stamp in missing
+                        )
+                    ):
+                        trade.update(
+                            review_from=trade["status"],
+                            status="REVIEW",
+                            reason="Missing 5m history",
+                        )
+                        break
+
+                    events = advance(trade, ts, bar)
+
+                    for stamp, kind, delta_r in events:
+                        db.execute(
+                            f"INSERT INTO {E}"
+                            "(trade_id, ts, kind, pnl) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                trade["id"],
+                                stamp,
+                                kind,
+                                delta_r * trade["risk"],
+                            ),
+                        )
+
+                    if trade["status"] in (
+                        "CLOSED", "CANCELLED"
+                    ):
+                        break
+
+                if (
+                    trade["status"] == "PENDING"
+                    and now >= trade["fill_at"] + 3600
+                ):
+                    trade.update(
+                        status="CANCELLED",
+                        closed=now,
+                        reason="Entry data unavailable for one hour",
+                    )
+
+                if (
+                    trade["status"] in ("OPEN", "PARTIAL")
+                    and market_open(pair, now)
+                    and now - trade["checked"] - 300 > 900
+                    and bars.empty
+                ):
+                    trade.update(
+                        review_from=trade["status"],
+                        status="REVIEW",
+                        reason="Missing recent 5m history",
+                    )
+
+                columns = [
+                    "status",
+                    "review_from",
+                    "entry",
+                    "sl",
+                    "tp1",
+                    "tp2",
+                    "remaining",
+                    "gross_r",
+                    "mark",
+                    "mark_ts",
+                    "closed",
+                    "net_r",
+                    "checked",
+                    "reason",
+                ]
+
+                assignments = ",".join(
+                    column + "=?" for column in columns
+                )
+
+                db.execute(
+                    f"UPDATE {T} SET "
+                    + assignments
+                    + " WHERE id=?",
+                    [trade.get(column) for column in columns]
+                    + [trade["id"]],
+                )
+
+                if trade["status"] != old_status:
+                    text = (
+                        f"PAPER #{trade['id']} "
+                        f"{pair.upper()}: {trade['status']}"
+                    )
+
+                    if trade["entry"] is not None:
+                        text += (
+                            f"\nEntry {trade['entry']:.5f}; "
+                            f"SL {trade['sl']:.5f}; "
+                            f"TP1 {trade['tp1']:.5f}; "
+                            f"TP2 {trade['tp2']:.5f}"
+                        )
+
+                    if trade["net_r"] is not None:
+                        text += (
+                            f"\nNet {trade['net_r']:.2f}R / "
+                            f"${trade['net_r'] * trade['risk']:.2f}"
+                        )
+
+                    if trade["reason"]:
+                        text += "\n" + trade["reason"]
+
+                    self.notify(db, text, now)
+
+    def summary(self, days=None):
+        now = int(time.time())
+        cutoff = now - days * 86400 if days else 0
+
+        with self.db() as db:
+            base = float(
+                db.execute(
+                    f"SELECT value FROM {M} "
+                    "WHERE key='initial_balance'"
+                ).fetchone()[0]
+            )
+            ledger = db.execute(
+                f"SELECT value FROM {M} "
+                "WHERE key='ledger_id'"
+            ).fetchone()[0]
+            legacy = db.execute(
+                f"SELECT value FROM {M} "
+                "WHERE key='legacy_preserved'"
+            ).fetchone()[0]
+
+            cash = base + db.execute(
+                f"SELECT COALESCE(SUM(pnl),0) FROM {E}"
+            ).fetchone()[0]
+
+            booked = db.execute(
+                f"SELECT COALESCE(SUM(pnl),0) FROM {E} "
+                "WHERE ts>=?",
+                (cutoff,),
+            ).fetchone()[0]
+
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    f"SELECT * FROM {T}"
+                )
+            ]
+
+        floating = sum(
+            trade["remaining"]
+            * trade["side"]
+            * (trade["mark"] - trade["entry"])
+            / trade["distance"]
+            * trade["risk"]
+            for trade in rows
+            if trade["status"] in ACTIVE
+            and trade["entry"] is not None
+            and trade["mark"] is not None
+        )
+
+        lines = [
+            f"PAPER ledger {ledger}"
+            + (" | last 7 days" if days else " | all time"),
+            f"Cash ${cash:.2f}; "
+            f"last-mark equity ~${cash + floating:.2f}",
+            f"Booked PnL in window ${booked:.2f} "
+            "(includes fees/partials).",
         ]
-        closed = [
-            trade for trade in group
-            if trade["net_r"] is not None
-        ]
-        wins = sum(
-            trade["net_r"] > 0
-            for trade in closed
-        )
-        rate = (
-            f"{100 * wins / len(closed):.1f}%"
-            if closed
-            else "N/A"
-        )
-        pnl = sum(
-            trade["risk"] * trade["net_r"]
-            for trade in closed
-        )
-        active = sum(
+
+        for pair in PAIRS:
+            closed = [
+                trade
+                for trade in rows
+                if trade["pair"] == pair
+                and trade["status"] == "CLOSED"
+                and trade["closed"] >= cutoff
+            ]
+
+            wins = sum(
+                trade["net_r"] > 0
+                for trade in closed
+            )
+            winrate = (
+                f"{wins / len(closed) * 100:.1f}%"
+                if closed
+                else "N/A"
+            )
+
+            active = sum(
+                trade["pair"] == pair
+                and trade["status"] in ACTIVE
+                for trade in rows
+            )
+
+            lines.append(
+                f"{pair.upper()}: closed {len(closed)}, "
+                f"win {winrate}, active/review {active}"
+            )
+
+        if any(
+            trade["status"] == "REVIEW"
+            for trade in rows
+        ):
+            lines.append(
+                "REVIEW: equity marks may be stale; "
+                "new entries blocked."
+            )
+
+        if any(
             trade["status"] in ACTIVE
-            for trade in group
+            and trade["mark_ts"]
+            and market_open(trade["pair"], now)
+            and now - trade["mark_ts"] > 900
+            for trade in rows
+        ):
+            lines.append(
+                "Warning: some equity marks are "
+                "older than 15 minutes."
+            )
+
+        if legacy == "1":
+            lines.append(
+                "Legacy tables preserved separately; "
+                "not included in this fresh ledger."
+            )
+
+        return (
+            "\n".join(lines)
+            + "\nOHLC estimates, assumed costs; no broker fills."
         )
 
-        lines.append(
-            f"{pair.upper()}: closed {len(closed)}, "
-            f"win {rate}, net ${pnl:.2f}, "
-            f"active/review {active}"
+    def export(self):
+        with self.db() as db:
+            cursor = db.execute(
+                f"SELECT * FROM {T} ORDER BY id"
+            )
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+
+            writer.writerow(
+                [column[0] for column in cursor.description]
+            )
+            writer.writerows(cursor)
+
+            return output.getvalue().encode("utf-8-sig")
+
+    def cleanup(self):
+        with self.db() as db:
+            count = db.execute(
+                f"UPDATE {T} SET archived=1 "
+                "WHERE status IN ('CLOSED','CANCELLED') "
+                "AND archived=0"
+            ).rowcount
+
+            db.execute(
+                f"DELETE FROM {O} "
+                "WHERE delivered IS NOT NULL "
+                "AND delivered<?",
+                (int(time.time()) - 30 * 86400,),
+            )
+
+        return (
+            f"Archived {count} terminal records; "
+            "all trades and accounting history retained."
         )
 
-    return "\n".join(lines)
+    def pending_messages(self, now):
+        with self.db() as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    f"SELECT * FROM {O} "
+                    "WHERE delivered IS NULL AND next_try<=? "
+                    "ORDER BY id LIMIT 20",
+                    (now,),
+                )
+            ]
+
+    def delivery(
+        self,
+        message,
+        now,
+        delay=None,
+        forbidden=False,
+    ):
+        with self.db() as db:
+            if forbidden:
+                db.execute(
+                    f"DELETE FROM {S} WHERE chat_id=?",
+                    (message["chat_id"],),
+                )
+                db.execute(
+                    f"DELETE FROM {O} "
+                    "WHERE chat_id=? AND delivered IS NULL",
+                    (message["chat_id"],),
+                )
+
+            elif delay is None:
+                db.execute(
+                    f"UPDATE {O} SET delivered=? WHERE id=?",
+                    (now, message["id"]),
+                )
+
+            else:
+                db.execute(
+                    f"UPDATE {O} "
+                    "SET attempts=attempts+1, next_try=? "
+                    "WHERE id=?",
+                    (now + delay, message["id"]),
+                )
 
 
-def chart(frame, pair):
+def make_chart(frame, pair):
     os.environ.setdefault(
         "MPLCONFIGDIR",
-        str(Path(DB).resolve().parent / "mpl-cache"),
+        "/tmp/jarvis-mpl",
     )
 
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(7, 3.5))
+
     try:
-        for i, row in enumerate(frame.tail(40).itertuples()):
+        for i, row in enumerate(
+            frame.tail(40).itertuples()
+        ):
             color = (
-                "green" if row.Close >= row.Open else "red"
+                "green"
+                if row.Close >= row.Open
+                else "red"
+            )
+
+            ax.plot(
+                [i, i],
+                [row.Low, row.High],
+                color=color,
+                lw=1,
             )
             ax.plot(
-                [i, i], [row.Low, row.High],
-                color=color, lw=1,
-            )
-            ax.plot(
-                [i, i], [row.Open, row.Close],
-                color=color, lw=4,
+                [i, i],
+                [row.Open, row.Close],
+                color=color,
+                lw=4,
             )
 
         ax.set_title(
@@ -689,512 +1291,539 @@ def chart(frame, pair):
         fig.tight_layout()
 
         output = io.BytesIO()
-        fig.savefig(output, format="png", dpi=120)
+        fig.savefig(output, format="png", dpi=110)
+
         return output.getvalue()
+
     finally:
         plt.close(fig)
 
 
-def backup_sheet():
-    """Optional V12 snapshot; never imports old V11 results."""
-    if (
-        not os.getenv("SHEET_ID")
-        or not os.getenv("GOOGLE_CREDENTIALS")
-    ):
-        return
+class Engine:
+    def __init__(self, cfg, health):
+        self.cfg = cfg
+        self.health = health
+        self.store = Store(cfg)
 
-    import gspread
+        self.pipeline = asyncio.Lock()
+        self.delivery_lock = asyncio.Lock()
+        self.chart_lock = asyncio.Lock()
 
-    rows = all_trades()
-    if not rows:
-        return
+        # Network slots are separate from database work.
+        self.workers = asyncio.Semaphore(3)
 
-    header = list(rows[0])
-    client = gspread.service_account_from_dict(
-        json.loads(os.environ["GOOGLE_CREDENTIALS"])
-    )
-    book = client.open_by_key(os.environ["SHEET_ID"])
-
-    try:
-        sheet = book.worksheet("jarvis_v12")
-        existing = sheet.row_values(1)
-        if existing and existing != header:
-            raise ValueError(
-                "Unexpected jarvis_v12 worksheet header; "
-                "refusing overwrite"
-            )
-    except gspread.WorksheetNotFound:
-        sheet = book.add_worksheet(
-            title="jarvis_v12",
-            rows=max(100, len(rows) + 1),
-            cols=len(header),
-        )
-
-    if (
-        sheet.row_count < len(rows) + 1
-        or sheet.col_count < len(header)
-    ):
-        sheet.resize(
-            rows=max(sheet.row_count, len(rows) + 1),
-            cols=max(sheet.col_count, len(header)),
-        )
-
-    values = [header] + [
-        [
-            "" if row[key] is None else row[key]
-            for key in header
-        ]
-        for row in rows
-    ]
-    sheet.update(
-        values=values,
-        range_name="A1",
-        raw=True,
-    )
-
-
-async def permitted(update, admin=False):
-    ok = (
-        update.effective_chat
-        and update.effective_chat.id in ALLOWED
-    )
-    if admin:
-        ok = (
-            ok
-            and update.effective_user
-            and update.effective_user.id in ADMINS
-        )
-
-    if not ok:
-        await update.effective_message.reply_text(
-            "Access denied."
-        )
-
-    return bool(ok)
-
-
-async def broadcast(context, text, photo=None):
-    with connect() as db:
-        chats = [
-            row[0]
-            for row in db.execute(
-                "SELECT chat_id FROM subscribers"
-            )
-            if row[0] in ALLOWED
-        ]
-
-    for chat_id in chats:
-        try:
-            if photo:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=io.BytesIO(photo),
-                    caption=text,
+    async def run(self, function, *args):
+        if function in (fetch, signal_check):
+            async with self.workers:
+                return await asyncio.to_thread(
+                    function, *args
                 )
-            else:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
+
+        return await asyncio.to_thread(
+            function, *args
+        )
+
+    async def refresh(self):
+        trades = await self.run(self.store.active)
+        cursors = {}
+
+        for trade in trades:
+            pair = trade["pair"]
+            start = trade["checked"] + 300
+
+            cursors[pair] = min(
+                cursors.get(pair, start),
+                start,
+            )
+
+        now = int(time.time())
+
+        results = await asyncio.gather(
+            *(
+                self.run(fetch, pair, 5, now, since)
+                for pair, since in cursors.items()
+            ),
+            return_exceptions=True,
+        )
+
+        healthy = True
+
+        for pair, result in zip(cursors, results):
+            if isinstance(result, BaseException):
+                LOG.warning(
+                    "Tracking fetch failed for %s: %s",
+                    pair,
+                    type(result).__name__,
                 )
-        except Exception:
-            LOG.exception("Telegram delivery failed")
+                healthy = False
+                continue
 
-
-async def new_signal(pair, context):
-    now = int(time.time())
-
-    if not session_open(pair, now):
-        return "Outside session / market closed."
-
-    frame = await asyncio.to_thread(
-        get_frame, pair, 60
-    )
-    setup = analyse(frame, now)
-
-    if not setup:
-        return (
-            "WAIT: no qualified fresh "
-            "closed-candle setup."
-        )
-
-    trade_id = await asyncio.to_thread(
-        reserve,
-        pair,
-        int(frame.index[-1]),
-        now,
-        setup,
-    )
-
-    if not trade_id:
-        return (
-            "No new entry: duplicate, cooldown, "
-            "exposure or risk limit."
-        )
-
-    side, price, distance, rsi = setup
-
-    with connect() as db:
-        risk = db.execute(
-            "SELECT risk FROM trades WHERE id=?",
-            (trade_id,),
-        ).fetchone()[0]
-
-    text = (
-        f"PAPER #{trade_id} "
-        f"{'BUY' if side == 1 else 'SELL'} "
-        f"{pair.upper()}\n"
-        f"Reference: {price:.5f} | RSI {rsi:.1f}\n"
-        f"Paper risk: ${risk:.2f} before assumed costs.\n"
-        f"SL distance: {distance:.5f}; "
-        "50% TP1=1R, 50% TP2=2R.\n"
-        "Model entry: next 5m open; "
-        "excessive gap cancels.\n"
-        "No broker order. Yahoo FX indicative / "
-        "Coinbase BTC-USD.\n"
-        "Manual broker sizing and prop-firm "
-        "checks required."
-    )
-
-    photo = None
-    try:
-        photo = await asyncio.to_thread(
-            chart, frame, pair
-        )
-    except Exception:
-        LOG.exception("Chart unavailable; sending text")
-
-    await broadcast(context, text, photo)
-    return text
-
-
-async def refresh(context):
-    healthy = True
-    rows = await asyncio.to_thread(all_trades)
-
-    active_pairs = {
-        trade["pair"]
-        for trade in rows
-        if trade["status"] in ACTIVE
-    }
-
-    for pair in active_pairs:
-        try:
-            frame = await asyncio.to_thread(
-                get_frame, pair, 5
-            )
-            now = int(time.time())
-            age = now - int(frame.index[-1]) - 300
-
-            if market_open(pair, now) and age > 900:
-                raise ValueError("Stale tracking data")
-
-            events = await asyncio.to_thread(
-                track, pair, frame, now
-            )
-            for event in events:
-                await broadcast(context, event)
-
-        except Exception:
-            healthy = False
-            LOG.exception(
-                "Tracking failed for %s; "
-                "new entries paused this cycle",
+            await self.run(
+                self.store.track,
                 pair,
+                result,
+                now,
             )
 
-    return healthy
+        for trade in await self.run(self.store.active):
+            stale = (
+                trade["status"] != "PENDING"
+                and market_open(trade["pair"], now)
+                and now - trade["checked"] - 300 > 900
+            )
 
+            if trade["status"] == "REVIEW" or stale:
+                healthy = False
 
-async def command(update, context):
-    cmd = (
-        update.effective_message.text
-        .split()[0]
-        .split("@")[0]
-        .lstrip("/")
-    )
+        return healthy
 
-    if not await permitted(
-        update,
-        cmd in ("export", "cleanup"),
-    ):
-        return
+    async def check(self, pair, requester=None):
+        frame, setup, reason = await self.run(
+            signal_check,
+            pair,
+            int(time.time()),
+        )
 
-    message = update.effective_message
+        if setup:
+            reason = await self.run(
+                self.store.reserve,
+                setup,
+                int(time.time()),
+                requester,
+            )
 
-    async with LOCK:
-        if cmd in ("start", "stop"):
-            with connect() as db:
-                if cmd == "start":
-                    db.execute(
-                        "INSERT OR IGNORE INTO "
-                        "subscribers VALUES (?)",
-                        (update.effective_chat.id,),
+        return frame, reason
+
+    async def flush(self, bot):
+        if self.delivery_lock.locked():
+            return
+
+        async with self.delivery_lock:
+            messages = await self.run(
+                self.store.pending_messages,
+                int(time.time()),
+            )
+
+            for message in messages:
+                if message["chat_id"] not in self.cfg.chats:
+                    await self.run(
+                        self.store.delivery,
+                        message,
+                        int(time.time()),
+                        None,
+                        True,
                     )
+                    continue
+
+                try:
+                    await bot.send_message(
+                        chat_id=message["chat_id"],
+                        text=(
+                            f"[event {message['id']}] "
+                            f"{message['text']}"
+                        ),
+                    )
+
+                except Forbidden:
+                    await self.run(
+                        self.store.delivery,
+                        message,
+                        int(time.time()),
+                        None,
+                        True,
+                    )
+
+                except Exception as exc:
+                    if isinstance(exc, RetryAfter):
+                        retry = exc.retry_after
+                    else:
+                        retry = min(
+                            3600,
+                            30 * 2 ** min(
+                                message["attempts"], 7
+                            ),
+                        )
+
+                    if hasattr(retry, "total_seconds"):
+                        retry = retry.total_seconds()
+
+                    await self.run(
+                        self.store.delivery,
+                        message,
+                        int(time.time()),
+                        max(1, int(retry)),
+                    )
+
+                    LOG.warning(
+                        "Notification %s failed: %s",
+                        message["id"],
+                        type(exc).__name__,
+                    )
+                    break
+
                 else:
-                    db.execute(
-                        "DELETE FROM subscribers "
-                        "WHERE chat_id=?",
-                        (update.effective_chat.id,),
+                    await self.run(
+                        self.store.delivery,
+                        message,
+                        int(time.time()),
                     )
+
+    async def tick(self, context):
+        self.health.beat = time.monotonic()
+
+        if not self.pipeline.locked():
+            async with self.pipeline:
+                healthy = await self.refresh()
+
+                if (
+                    healthy
+                    and await self.run(self.store.subscribed)
+                ):
+                    results = await asyncio.gather(
+                        *(
+                            self.check(pair)
+                            for pair in PAIRS
+                        ),
+                        return_exceptions=True,
+                    )
+
+                    for pair, result in zip(PAIRS, results):
+                        if isinstance(result, BaseException):
+                            LOG.warning(
+                                "Signal check failed for %s: %s",
+                                pair,
+                                type(result).__name__,
+                            )
+
+        await self.flush(context.bot)
+
+    async def allowed(self, update, admin=False):
+        ok = (
+            update.effective_chat is not None
+            and update.effective_chat.id in self.cfg.chats
+        )
+
+        if admin:
+            ok = (
+                ok
+                and update.effective_user is not None
+                and update.effective_user.id in self.cfg.admins
+            )
+
+        if not ok:
+            await update.effective_message.reply_text(
+                "Access denied."
+            )
+
+        return ok
+
+    async def command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        command = (
+            update.effective_message.text
+            .split()[0]
+            .split("@")[0]
+            .lstrip("/")
+            .lower()
+        )
+
+        if not await self.allowed(
+            update,
+            command in ("export", "cleanup"),
+        ):
+            return
+
+        message = update.effective_message
+
+        if command in ("start", "stop"):
+            await self.run(
+                self.store.subscribe,
+                update.effective_chat.id,
+                command == "start",
+            )
 
             await message.reply_text(
-                "Subscribed."
-                if cmd == "start"
-                else "Unsubscribed."
+                "Subscribed to PAPER signals. /help"
+                if command == "start"
+                else (
+                    "Unsubscribed; existing model trades "
+                    "continue tracking."
+                )
             )
 
-        elif cmd == "signal":
-            pair = (
+        elif command == "signal":
+            aliases = {
+                "btc-usd": "btcusd",
+                "eurusd=x": "eurusd",
+                "gbpusd=x": "gbpusd",
+            }
+
+            argument = (
                 context.args[0].lower()
                 if context.args
                 else "btcusd"
             )
+            pair = aliases.get(argument, argument)
 
             if pair not in PAIRS:
                 await message.reply_text(
-                    "Available: btcusd, eurusd, gbpusd. "
-                    "XAUUSD disabled until a matching "
-                    "spot feed is configured."
+                    "Use /signal btcusd, eurusd or gbpusd. "
+                    "XAUUSD is disabled."
                 )
                 return
 
-            if not await refresh(context):
+            if self.pipeline.locked():
                 await message.reply_text(
-                    "Tracking data unavailable; "
-                    "new entries paused."
+                    "Another check is running; retry shortly. "
+                    "/stats remains available."
                 )
                 return
-
-            text = await new_signal(pair, context)
-            await message.reply_text(text)
-
-        elif cmd in ("stats", "weekly", "result"):
-            text = await asyncio.to_thread(
-                report,
-                7 if cmd == "weekly" else None,
-            )
-            await message.reply_text(text)
-
-        elif cmd == "export":
-            rows = await asyncio.to_thread(all_trades)
-
-            if not rows:
-                await message.reply_text("No trades.")
-                return
-
-            stream = io.StringIO()
-            writer = csv.DictWriter(
-                stream,
-                fieldnames=list(rows[0]),
-            )
-            writer.writeheader()
-            writer.writerows(rows)
-
-            await message.reply_document(
-                document=io.BytesIO(
-                    stream.getvalue().encode()
-                ),
-                filename="jarvis_v12.csv",
-            )
-
-        elif cmd == "cleanup":
-            with connect() as db:
-                db.execute(
-                    "UPDATE trades SET archived=1 "
-                    "WHERE status IN "
-                    "('CLOSED', 'CANCELLED')"
-                )
 
             await message.reply_text(
-                "Closed records archived. History and "
-                "all active/review records retained."
+                "Checking fresh completed candles: "
+                f"{pair.upper()}..."
+            )
+
+            async with self.pipeline:
+                if not await self.refresh():
+                    await message.reply_text(
+                        "New entries paused: tracking stale, "
+                        "catching up, unavailable or in REVIEW."
+                    )
+                    return
+
+                frame, reason = await self.check(
+                    pair,
+                    update.effective_chat.id,
+                )
+
+            await message.reply_text(reason)
+
+            if not frame.empty:
+                try:
+                    async with self.chart_lock:
+                        photo = await self.run(
+                            make_chart,
+                            frame,
+                            pair,
+                        )
+
+                    await message.reply_photo(
+                        photo=io.BytesIO(photo),
+                        caption=(
+                            "Completed hourly candles; PAPER only."
+                        ),
+                    )
+
+                except Exception as exc:
+                    LOG.warning(
+                        "Chart failed: %s",
+                        type(exc).__name__,
+                    )
+
+            await self.flush(context.bot)
+
+        elif command in ("stats", "weekly"):
+            text = await self.run(
+                self.store.summary,
+                7 if command == "weekly" else None,
+            )
+            await message.reply_text(text)
+
+        elif command == "export":
+            data = await self.run(self.store.export)
+
+            await message.reply_document(
+                document=io.BytesIO(data),
+                filename="jarvis_v12_paper.csv",
+            )
+
+        elif command == "cleanup":
+            await message.reply_text(
+                await self.run(self.store.cleanup)
             )
 
         else:
             await message.reply_text(
-                "JARVIS V12 PAPER\n"
+                "JARVIS V12 PAPER — one shared model account.\n"
                 "/start /stop\n"
                 "/signal btcusd|eurusd|gbpusd\n"
-                "/stats /weekly /result\n"
+                "/stats /weekly\n"
                 "Admin: /export /cleanup\n\n"
+                "Signals: first 10 minutes after 1H close.\n"
+                "Tracking: completed 5m candles.\n"
                 "Forex: London 08-12 OR "
-                "(London 13-17 AND New York 08-12), "
-                "DST-aware. BTC 24/7.\n"
-                "New signals: first 10 minutes "
-                "after hourly close.\n"
-                "No guaranteed win rate; "
-                "no broker execution."
+                "(London 13-17 AND NY 08-12), DST-aware.\n"
+                "BTC: 24/7.\n"
+                "SL=1.5 ATR. 50% at 1R, remaining at 2R; "
+                "original SL retained.\n"
+                "Strict stop-first if both touched.\n"
+                "Missing history => REVIEW.\n"
+                "Paper estimates only; no broker orders "
+                "or guaranteed win rate."
             )
 
+    async def startup(self, app):
+        await self.run(self.store.initialize)
 
-async def job(context):
-    global HEARTBEAT
-    HEARTBEAT = time.monotonic()
+        self.health.ready = True
+        self.health.beat = time.monotonic()
 
-    async with LOCK:
-        last_backup = context.application.bot_data.get(
-            "last_backup", 0
+        app.job_queue.run_repeating(
+            self.tick,
+            interval=60,
+            first=2,
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+            },
         )
-        if time.time() - last_backup >= 600:
-            context.application.bot_data[
-                "last_backup"
-            ] = time.time()
 
-            try:
-                await asyncio.to_thread(backup_sheet)
-            except Exception:
-                LOG.exception(
-                    "Optional Sheets backup failed; "
-                    "SQLite remains authoritative"
-                )
+    async def shutdown(self, app):
+        self.health.ready = False
 
-        if not await refresh(context):
-            return
 
-        with connect() as db:
-            subscribed = any(
-                row[0] in ALLOWED
-                for row in db.execute(
-                    "SELECT chat_id FROM subscribers"
-                )
+@dataclass
+class Health:
+    ready: bool = False
+    beat: float = 0
+
+
+def health_server(health):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path not in ("/", "/healthz"):
+                self.send_error(404)
+                return
+
+            ok = (
+                health.ready
+                and time.monotonic() - health.beat < 300
             )
 
-        if not subscribed:
-            return
+            body = (
+                b"Jarvis V12 PAPER: ready\n"
+                if ok
+                else b"Starting or scheduler stalled\n"
+            )
 
-        for pair in PAIRS:
-            try:
-                await new_signal(pair, context)
-            except Exception:
-                LOG.exception(
-                    "Signal check failed for %s",
-                    pair,
-                )
+            self.send_response(200 if ok else 503)
+            self.send_header(
+                "Content-Type",
+                "text/plain; charset=utf-8",
+            )
+            self.send_header(
+                "Content-Length",
+                str(len(body)),
+            )
+            self.end_headers()
+            self.wfile.write(body)
 
+        def do_HEAD(self):
+            ok = (
+                health.ready
+                and time.monotonic() - health.beat < 300
+            )
+            self.send_response(200 if ok else 503)
+            self.end_headers()
 
-async def on_error(update, context):
-    LOG.error(
-        "Unhandled bot error",
-        exc_info=(
-            type(context.error),
-            context.error,
-            context.error.__traceback__,
-        ),
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", int(os.getenv("PORT", "10000"))),
+        Handler,
     )
 
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "Operation failed. Check server logs; "
-            "no broker order was placed."
-        )
+    threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+    ).start()
+
+    return server
+
+
+async def error_handler(update, context):
+    # Avoid logging Telegram URLs/tokens or exposing raw errors.
+    LOG.error(
+        "Handler/job failed: %s",
+        type(context.error).__name__,
+    )
+
+    if (
+        isinstance(update, Update)
+        and update.effective_message
+    ):
+        try:
+            await update.effective_message.reply_text(
+                "Check failed safely; no broker orders exist. "
+                "Retry later or check server logs."
+            )
+        except Exception:
+            LOG.warning(
+                "Could not deliver error notification"
+            )
 
 
 def main():
-    from telegram.ext import Application, CommandHandler
-
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+        format=(
+            "%(asctime)s %(levelname)s "
+            "%(name)s: %(message)s"
+        ),
     )
+
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-    if (
-        not os.getenv("BOT_TOKEN")
-        or not ADMINS
-        or not ALLOWED
-    ):
-        raise SystemExit(
-            "Set BOT_TOKEN, ADMIN_USER_IDS and "
-            "ALLOWED_CHAT_IDS "
-            "(comma-separated numeric IDs)."
-        )
-
-    finite = all(
-        math.isfinite(value)
-        for value in [
-            BALANCE, RISK, MAX_OPEN,
-            DAY_LIMIT, DD_LIMIT, COST_R,
-        ]
-    )
-    valid = (
-        BALANCE > 0
-        and 0 < RISK <= MAX_OPEN <= DAY_LIMIT <= DD_LIMIT < 1
-        and COST_R >= 0
-    )
-
-    if not finite or not valid:
-        raise SystemExit("Invalid risk configuration")
-
-    init_db()
-
-    if os.getenv("PORT"):
-        class Health(BaseHTTPRequestHandler):
-            def do_GET(self):
-                healthy = (
-                    time.monotonic() - HEARTBEAT < 180
-                )
-                self.send_response(
-                    200 if healthy else 503
-                )
-                self.end_headers()
-                self.wfile.write(
-                    b"Jarvis V12 paper bot"
-                )
-
-            def do_HEAD(self):
-                healthy = (
-                    time.monotonic() - HEARTBEAT < 180
-                )
-                self.send_response(
-                    200 if healthy else 503
-                )
-                self.end_headers()
-
-            def log_message(self, *args):
-                pass
-
-        server = HTTPServer(
-            ("0.0.0.0", int(os.environ["PORT"])),
-            Health,
-        )
-        threading.Thread(
-            target=server.serve_forever,
-            daemon=True,
-        ).start()
+    cfg = Settings.load()
+    health = Health()
+    engine = Engine(cfg, health)
 
     app = (
         Application.builder()
-        .token(os.environ["BOT_TOKEN"])
+        .token(cfg.token)
+        .concurrent_updates(8)
+        .post_init(engine.startup)
+        .post_shutdown(engine.shutdown)
         .build()
     )
 
-    for name in (
-        "start", "stop", "help", "signal",
-        "stats", "weekly", "result",
-        "export", "cleanup",
+    if app.job_queue is None:
+        raise RuntimeError(
+            "Install python-telegram-bot[job-queue]"
+        )
+
+    for command in (
+        "start",
+        "stop",
+        "help",
+        "signal",
+        "stats",
+        "weekly",
+        "export",
+        "cleanup",
     ):
         app.add_handler(
-            CommandHandler(name, command)
+            CommandHandler(command, engine.command)
         )
 
-    app.add_error_handler(on_error)
+    app.add_error_handler(error_handler)
+    server = health_server(health)
 
-    if app.job_queue is None:
-        raise SystemExit(
-            "Install python-telegram-bot[job-queue]."
+    try:
+        app.run_polling(
+            drop_pending_updates=False,
+            allowed_updates=["message"],
         )
-
-    app.job_queue.run_repeating(
-        job,
-        interval=60,
-        first=5,
-        job_kwargs={
-            "max_instances": 1,
-            "coalesce": True,
-        },
-    )
-
-    app.run_polling(drop_pending_updates=False)
+    finally:
+        health.ready = False
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":
