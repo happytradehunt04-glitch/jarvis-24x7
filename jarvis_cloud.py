@@ -1,6 +1,7 @@
-"""Jarvis V12 PAPER: trading logic unchanged; enhanced Telegram UX."""
+"""Jarvis V12 PAPER: resilient HTTP, local process lock, Telegram UX."""
 
 import asyncio
+import copy
 import csv
 import io
 import json
@@ -16,13 +17,19 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlencode, urlsplit, parse_qs
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 from telegram import Update
-from telegram.error import BadRequest, Forbidden, RetryAfter
+from telegram.error import (
+    BadRequest,
+    Conflict,
+    Forbidden,
+    RetryAfter,
+    TimedOut,
+)
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 LOG = logging.getLogger("jarvis")
@@ -44,6 +51,332 @@ M = "j12_meta"
 DISPLAY_TZ = ZoneInfo("Asia/Kolkata")
 PLOT_LOCK = threading.Lock()
 
+HTTP_LOCAL = threading.local()
+CACHE_LOCK = threading.Lock()
+YAHOO_CACHE = {}
+YAHOO_RETRY_AFTER = {}
+YAHOO_FALLBACK_MAX_AGE = 900
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+
+@contextmanager
+def single_instance(path="/tmp/jarvis_bot.lock"):
+    """
+    Linux local-filesystem lock.
+
+    Separate Render containers do not share this lock.
+    """
+    import fcntl
+
+    fd = os.open(
+        path,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    acquired = False
+
+    try:
+        try:
+            fcntl.flock(
+                fd,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+            acquired = True
+        except BlockingIOError:
+            LOG.warning("Another instance is running, exiting")
+
+        if acquired:
+            os.ftruncate(fd, 0)
+            os.write(fd, str(os.getpid()).encode())
+
+        yield acquired
+
+    finally:
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+        os.close(fd)
+
+        # Do not unlink: unlinking can introduce an inode race.
+
+
+def http_session():
+    # requests.Session is thread-local, not shared between workers.
+    if not hasattr(HTTP_LOCAL, "session"):
+        HTTP_LOCAL.session = requests.Session()
+        HTTP_LOCAL.session.headers.update(BROWSER_HEADERS)
+
+        ca = (
+            os.getenv("REQUESTS_CA_BUNDLE")
+            or os.getenv("SSL_CERT_FILE")
+        )
+        if ca:
+            HTTP_LOCAL.session.verify = ca
+
+    return HTTP_LOCAL.session
+
+
+def closed_yahoo_snapshot(payload, url, observed_at):
+    """
+    Cache only candles already complete at observation time.
+
+    Never promote a cached partial candle to a completed candle later.
+    """
+    result = copy.deepcopy(payload)
+    chart = result.get("chart", {})
+
+    if chart.get("error") or not chart.get("result"):
+        raise ValueError("Yahoo returned a JSON API error")
+
+    interval = parse_qs(
+        urlsplit(url).query
+    ).get("interval", [""])[0]
+
+    seconds = {
+        "1h": 3600,
+        "5m": 300,
+    }.get(interval)
+
+    if seconds is None:
+        raise ValueError("Unsupported Yahoo cache interval")
+
+    for item in chart["result"]:
+        stamps = item["timestamp"]
+
+        keep = [
+            i
+            for i, ts in enumerate(stamps)
+            if int(ts) + seconds <= observed_at
+        ]
+
+        item["timestamp"] = [
+            stamps[i] for i in keep
+        ]
+
+        for group in item["indicators"].values():
+            for values in group:
+                for key, series in values.items():
+                    if isinstance(series, list):
+                        if len(series) != len(stamps):
+                            raise ValueError(
+                                "Mismatched Yahoo quote lengths"
+                            )
+                        values[key] = [
+                            series[i] for i in keep
+                        ]
+
+        frame = pd.DataFrame(
+            item["indicators"]["quote"][0],
+            index=item["timestamp"],
+        ).rename(columns=str.title)
+
+        if not frame.empty:
+            frame = frame.loc[
+                ~frame[
+                    ["Open", "High", "Low", "Close"]
+                ].isna().all(axis=1)
+            ]
+
+            # Invalid data must not overwrite the last valid cache.
+            normalize(frame, seconds, observed_at)
+
+    return result
+
+
+def yahoo_cached(url):
+    with CACHE_LOCK:
+        entry = YAHOO_CACHE.get(url)
+
+        if (
+            entry
+            and time.monotonic() - entry[0]
+            <= YAHOO_FALLBACK_MAX_AGE
+        ):
+            return copy.deepcopy(entry[1])
+
+    return None
+
+
+def json_get(url):
+    host = (
+        urlsplit(url).hostname or ""
+    ).lower()
+
+    yahoo = host in {
+        "query1.finance.yahoo.com",
+        "query2.finance.yahoo.com",
+    }
+
+    if yahoo:
+        with CACHE_LOCK:
+            entry = YAHOO_CACHE.get(url)
+            cooldown = YAHOO_RETRY_AFTER.get(url, 0)
+
+            # Short successful-response cache reduces duplicate requests.
+            if (
+                entry
+                and time.monotonic() - entry[0] < 30
+            ):
+                return copy.deepcopy(entry[1])
+
+        if time.monotonic() < cooldown:
+            cached = yahoo_cached(url)
+
+            if cached is not None:
+                LOG.warning(
+                    "Yahoo cooldown: using cached CLOSED candles; "
+                    "freshness gates remain active"
+                )
+                return cached
+
+            raise RuntimeError(
+                "Yahoo retry cooldown; no usable cache"
+            )
+
+    last_error = None
+
+    # Initial request + three Yahoo retries: 2s, 4s, 8s.
+    attempts = 4 if yahoo else 1
+
+    for attempt in range(attempts):
+        observed = int(time.time())
+        retry_after = 0
+        transient = True
+        status = None
+
+        try:
+            with http_session().get(
+                url,
+                timeout=(5, 15),
+                stream=True,
+            ) as response:
+                status = response.status_code
+
+                transient = status in (
+                    403,
+                    408,
+                    425,
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                )
+
+                header = response.headers.get(
+                    "Retry-After", ""
+                )
+
+                if header.isdigit():
+                    retry_after = min(30, int(header))
+
+                response.raise_for_status()
+
+                parts = []
+                size = 0
+
+                for part in response.iter_content(
+                    chunk_size=65536
+                ):
+                    size += len(part)
+
+                    if size > 8_000_000:
+                        raise ValueError(
+                            "Market-data response too large"
+                        )
+
+                    parts.append(part)
+
+                payload = json.loads(b"".join(parts))
+
+            if yahoo:
+                safe = closed_yahoo_snapshot(
+                    payload,
+                    url,
+                    observed,
+                )
+
+                with CACHE_LOCK:
+                    YAHOO_CACHE[url] = (
+                        time.monotonic(),
+                        safe,
+                    )
+                    YAHOO_RETRY_AFTER.pop(url, None)
+
+                return copy.deepcopy(safe)
+
+            return payload
+
+        except (
+            requests.RequestException,
+            ValueError,
+            KeyError,
+            TypeError,
+        ) as exc:
+            last_error = exc
+
+            code = getattr(
+                getattr(exc, "response", None),
+                "status_code",
+                status,
+            )
+
+            LOG.warning(
+                "Market data %s failed: HTTP=%s "
+                "type=%s attempt=%s/%s",
+                host,
+                code,
+                type(exc).__name__,
+                attempt + 1,
+                attempts,
+            )
+
+            if not yahoo:
+                break
+
+            if (
+                isinstance(exc, requests.HTTPError)
+                and not transient
+            ):
+                break
+
+            if attempt < attempts - 1:
+                # Executed in a worker thread, not the event loop.
+                time.sleep(
+                    max(
+                        2 ** (attempt + 1),
+                        retry_after,
+                    )
+                )
+
+    if yahoo:
+        with CACHE_LOCK:
+            YAHOO_RETRY_AFTER[url] = (
+                time.monotonic() + 60
+            )
+
+        cached = yahoo_cached(url)
+
+        if cached is not None:
+            LOG.warning(
+                "Yahoo failed: using cached CLOSED candles; "
+                "no timestamps are advanced"
+            )
+            return cached
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("Market data unavailable")
+
 
 def price(pair, value):
     return (
@@ -60,7 +393,9 @@ def local_time(ts):
 
 
 def next_window(pair, now):
-    candidate = (int(now) // 3600 + 1) * 3600
+    candidate = (
+        int(now) // 3600 + 1
+    ) * 3600
 
     for _ in range(8 * 24):
         if in_session(pair, candidate):
@@ -92,7 +427,9 @@ def chart_snapshot(
             int(ts),
             *[
                 float(row[column])
-                for column in ("Open", "High", "Low", "Close")
+                for column in (
+                    "Open", "High", "Low", "Close"
+                )
             ],
         ]
         for ts, row in frame.tail(40).iterrows()
@@ -137,7 +474,6 @@ def unpack_notice(raw):
     except (ValueError, TypeError):
         pass
 
-    # Previously queued plain-text messages remain deliverable.
     return raw, None
 
 
@@ -168,24 +504,24 @@ def update_message(trade, kind, stamp):
             "💵 Booked: +0.50R / "
             f"+${t['risk'] * 0.5:.2f} before costs.\n"
             f"🛑 Original SL retained: {price(pair, t['sl'])}\n"
-            "⏳ Remaining 50% target: "
-            f"{price(pair, t['tp2'])}"
+            f"⏳ Remaining 50% target: {price(pair, t['tp2'])}"
         )
 
     elif kind in ("TP2", "SL"):
         net = t["net_r"]
 
-        if kind == "TP2":
-            text = (
+        text = (
+            (
                 f"🏆 FULL TP2 HIT: {header}\n"
                 "Remaining 50% closed at 2R; trade completed.\n"
             )
-        else:
-            text = (
+            if kind == "TP2"
+            else (
                 f"❌ STOP LOSS HIT: {header}\n"
                 "Trade closed at the original SL "
                 "or adverse opening-gap price.\n"
             )
+        )
 
         text += (
             f"📊 Whole-trade gross: {t['gross_r']:+.2f}R\n"
@@ -359,24 +695,6 @@ def in_session(pair, ts):
     )
 
 
-def json_get(url):
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "JarvisPaper/12.0",
-            "Accept": "application/json",
-        },
-    )
-
-    with urlopen(request, timeout=15) as response:
-        body = response.read(8_000_001)
-
-    if len(body) > 8_000_000:
-        raise ValueError("Market-data response too large")
-
-    return json.loads(body)
-
-
 def normalize(frame, seconds, now):
     if frame.empty:
         return pd.DataFrame(
@@ -396,7 +714,6 @@ def normalize(frame, seconds, now):
 
     frame.index = index.astype("int64")
 
-    # Exclude forming/future candles before validating OHLC.
     frame = frame.loc[
         frame.index + seconds <= now
     ].sort_index()
@@ -501,7 +818,6 @@ def fetch(pair, minutes, now, since=None):
             index=result["timestamp"],
         ).rename(columns=str.title)
 
-        # All-null Yahoo rows are missing quotes, not prices.
         frame = frame.loc[
             ~frame[
                 ["Open", "High", "Low", "Close"]
@@ -626,7 +942,6 @@ def signal_check(pair, now):
 
 
 def advance(trade, ts, bar):
-    """Financial state transitions; original stop retained."""
     t = trade
     events = []
 
@@ -730,8 +1045,6 @@ def advance(trade, ts, bar):
 
 
 class Store:
-    """Public methods are called through asyncio.to_thread."""
-
     def __init__(self, cfg):
         self.cfg = cfg
         self.tz = ZoneInfo(cfg.firm_timezone)
@@ -1097,7 +1410,6 @@ class Store:
                 ),
             )
 
-            # A successful manual signal follows its outcomes.
             if requester in self.cfg.chats:
                 db.execute(
                     f"INSERT OR IGNORE INTO {S} VALUES (?)",
@@ -1201,7 +1513,6 @@ class Store:
 
                     bar_events = advance(trade, ts, bar)
 
-                    # Notify each accounting event, not just final status.
                     for stamp, kind, delta_r in bar_events:
                         db.execute(
                             f"INSERT INTO {E}"
@@ -1738,7 +2049,6 @@ def render_notice(raw):
 
 
 def explain_check(pair, now):
-    # The original signal_check remains the entry authority.
     frame, setup, reason = signal_check(pair, now)
 
     if setup:
@@ -1775,7 +2085,6 @@ def explain_check(pair, now):
                     "entry window. No late paper trade was created."
                 )
 
-            # Explanation only. This cannot authorize a late entry.
             close = frame.Close
             e20 = float(
                 close.ewm(
@@ -2331,6 +2640,30 @@ class Engine:
         self.health.ready = True
         self.health.beat = time.monotonic()
 
+        delay = float(
+            os.getenv(
+                "POLLING_START_DELAY_SECONDS",
+                "0",
+            )
+        )
+
+        if (
+            not math.isfinite(delay)
+            or not 0 <= delay <= 120
+        ):
+            raise ValueError(
+                "POLLING_START_DELAY_SECONDS "
+                "must be between 0 and 120"
+            )
+
+        if delay:
+            LOG.info(
+                "HTTP health ready; allowing %.0fs "
+                "for old deployment to drain before polling",
+                delay,
+            )
+            await asyncio.sleep(delay)
+
         app.job_queue.run_repeating(
             self.tick,
             interval=60,
@@ -2406,9 +2739,43 @@ def health_server(health):
 
 
 async def error_handler(update, context):
+    exc = context.error
+
+    if isinstance(exc, Conflict):
+        LOG.error(
+            "Telegram 409 Conflict: another poller uses "
+            "this token. Local /tmp locks do not coordinate "
+            "separate Render containers. Stop duplicate "
+            "services/local bots; deployment overlap can "
+            "also cause this."
+        )
+        return
+
+    if isinstance(exc, TimedOut):
+        LOG.warning(
+            "Telegram request timed out; "
+            "subscription may already have been saved"
+        )
+
+        if (
+            isinstance(update, Update)
+            and update.effective_message
+        ):
+            try:
+                await update.effective_message.reply_text(
+                    "⏳ Telegram connection timed out. "
+                    "Please retry your command shortly."
+                )
+            except Exception:
+                LOG.warning(
+                    "Timeout notification could not be delivered"
+                )
+
+        return
+
     LOG.error(
         "Handler/job failed: %s",
-        type(context.error).__name__,
+        type(exc).__name__,
     )
 
     if (
@@ -2426,7 +2793,7 @@ async def error_handler(update, context):
             )
 
 
-def main():
+def run_bot():
     logging.basicConfig(
         level=logging.INFO,
         format=(
@@ -2446,6 +2813,12 @@ def main():
         Application.builder()
         .token(cfg.token)
         .concurrent_updates(8)
+        .connect_timeout(10)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .get_updates_connect_timeout(10)
+        .get_updates_read_timeout(45)
         .post_init(engine.startup)
         .post_shutdown(engine.shutdown)
         .build()
@@ -2475,13 +2848,20 @@ def main():
 
     try:
         app.run_polling(
-            drop_pending_updates=False,
+            drop_pending_updates=True,
+            timeout=20,
             allowed_updates=["message"],
         )
     finally:
         health.ready = False
         server.shutdown()
         server.server_close()
+
+
+def main():
+    with single_instance() as acquired:
+        if acquired:
+            run_bot()
 
 
 if __name__ == "__main__":
