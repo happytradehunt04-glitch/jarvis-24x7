@@ -1,4 +1,4 @@
-"""Jarvis V12: one shared PAPER account; no broker/order APIs exist here."""
+"""Jarvis V12 PAPER: trading logic unchanged; enhanced Telegram UX."""
 
 import asyncio
 import csv
@@ -13,7 +13,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, urlencode
@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from telegram import Update
-from telegram.error import Forbidden, RetryAfter
+from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 LOG = logging.getLogger("jarvis")
@@ -40,6 +40,193 @@ E = "j12_events"
 S = "j12_subscribers"
 O = "j12_outbox"
 M = "j12_meta"
+
+DISPLAY_TZ = ZoneInfo("Asia/Kolkata")
+PLOT_LOCK = threading.Lock()
+
+
+def price(pair, value):
+    return (
+        f"{value:.2f}"
+        if pair == "btcusd"
+        else f"{value:.5f}"
+    )
+
+
+def local_time(ts):
+    return datetime.fromtimestamp(
+        ts, DISPLAY_TZ
+    ).strftime("%d %b %H:%M IST")
+
+
+def next_window(pair, now):
+    candidate = (int(now) // 3600 + 1) * 3600
+
+    for _ in range(8 * 24):
+        if in_session(pair, candidate):
+            return candidate
+        candidate += 3600
+
+    return None
+
+
+def chart_snapshot(
+    frame,
+    pair,
+    timeframe,
+    event,
+    trade=None,
+    cutoff=None,
+):
+    if frame is None:
+        return None
+
+    if cutoff is not None:
+        frame = frame.loc[frame.index <= cutoff]
+
+    if frame.empty:
+        return None
+
+    rows = [
+        [
+            int(ts),
+            *[
+                float(row[column])
+                for column in ("Open", "High", "Low", "Close")
+            ],
+        ]
+        for ts, row in frame.tail(40).iterrows()
+    ]
+
+    levels = None
+
+    if trade:
+        levels = {
+            key: trade.get(key)
+            for key in (
+                "entry",
+                "reference",
+                "sl",
+                "tp1",
+                "tp2",
+                "distance",
+                "side",
+                "id",
+            )
+        }
+
+    return {
+        "pair": pair,
+        "timeframe": timeframe,
+        "event": event,
+        "rows": rows,
+        "trade": levels,
+    }
+
+
+def unpack_notice(raw):
+    try:
+        data = json.loads(raw)
+
+        if (
+            isinstance(data, dict)
+            and data.get("ux_version") == 1
+        ):
+            return data["text"], data.get("chart")
+
+    except (ValueError, TypeError):
+        pass
+
+    # Previously queued plain-text messages remain deliverable.
+    return raw, None
+
+
+def update_message(trade, kind, stamp):
+    t = trade
+    pair = t["pair"]
+    header = f"{pair.upper()} | #{t['id']}"
+
+    if kind == "OPEN":
+        text = (
+            f"✅ TRADE OPENED: {header}\n"
+            f"{'📈 BUY' if t['side'] == 1 else '📉 SELL'}\n"
+            f"🎯 Entry: {price(pair, t['entry'])}\n"
+            f"🛑 SL: {price(pair, t['sl'])}\n"
+            f"🎯 TP1: {price(pair, t['tp1'])} "
+            "(50% at 1R)\n"
+            f"🎯 TP2: {price(pair, t['tp2'])} "
+            "(50% at 2R)\n"
+            f"💰 Initial risk: ${t['risk']:.2f}\n"
+            "Entry at 5m open, confirmed using a completed candle."
+        )
+
+    elif kind == "TP1":
+        text = (
+            f"🎯 PARTIAL TP1 HIT: {header}\n"
+            f"Closed 50% at {price(pair, t['tp1'])} "
+            "(+1R on that half).\n"
+            "💵 Booked: +0.50R / "
+            f"+${t['risk'] * 0.5:.2f} before costs.\n"
+            f"🛑 Original SL retained: {price(pair, t['sl'])}\n"
+            "⏳ Remaining 50% target: "
+            f"{price(pair, t['tp2'])}"
+        )
+
+    elif kind in ("TP2", "SL"):
+        net = t["net_r"]
+
+        if kind == "TP2":
+            text = (
+                f"🏆 FULL TP2 HIT: {header}\n"
+                "Remaining 50% closed at 2R; trade completed.\n"
+            )
+        else:
+            text = (
+                f"❌ STOP LOSS HIT: {header}\n"
+                "Trade closed at the original SL "
+                "or adverse opening-gap price.\n"
+            )
+
+        text += (
+            f"📊 Whole-trade gross: {t['gross_r']:+.2f}R\n"
+            f"💸 Assumed costs: {t['cost_r']:.2f}R\n"
+            f"💰 Whole-trade NET: {net:+.2f}R / "
+            f"${net * t['risk']:+.2f}"
+        )
+
+        if kind == "SL":
+            text += (
+                "\nIncludes any previous TP1 exit; "
+                "opening gaps may exceed planned risk."
+            )
+
+    elif kind == "CANCELLED":
+        text = (
+            f"⚠️ TRADE CANCELLED: {header}\n"
+            f"Reason: {t.get('reason') or 'Entry could not be verified.'}\n"
+            "No model fill; no costs or PnL booked. "
+            "Reserved risk released."
+        )
+
+    elif kind == "REVIEW":
+        text = (
+            f"🔎 TRADE NEEDS REVIEW: {header}\n"
+            "Missing 5m history; outcome is unknown.\n"
+            "New entries paused. Tracking retries when "
+            "the missing data is available."
+        )
+
+    else:
+        text = (
+            f"🔄 TRACKING RESUMED: {header}\n"
+            f"State: {t['status']}; missing history recovered."
+        )
+
+    return (
+        text
+        + f"\n🕒 {local_time(stamp)}"
+        + "\n🧪 PAPER ONLY"
+    )
 
 
 @dataclass(frozen=True)
@@ -64,10 +251,12 @@ class Settings:
                 for x in os.getenv(name, "").split(",")
                 if x.strip()
             )
+
             if not values:
                 raise ValueError(
                     f"{name} must contain numeric Telegram IDs"
                 )
+
             return values
 
         cfg = cls(
@@ -121,7 +310,9 @@ class Settings:
             < 1
             and cfg.cost_r >= 0
         ):
-            raise ValueError("Invalid account/risk configuration")
+            raise ValueError(
+                "Invalid account/risk configuration"
+            )
 
         if any(x <= 0 for x in cfg.admins) or 0 in cfg.chats:
             raise ValueError(
@@ -205,7 +396,7 @@ def normalize(frame, seconds, now):
 
     frame.index = index.astype("int64")
 
-    # Exclude forming/future candles before validating unfinished OHLC.
+    # Exclude forming/future candles before validating OHLC.
     frame = frame.loc[
         frame.index + seconds <= now
     ].sort_index()
@@ -246,7 +437,6 @@ def normalize(frame, seconds, now):
 
 
 def fetch(pair, minutes, now, since=None):
-    """Coinbase catch-up uses one bounded window per cycle."""
     seconds = minutes * 60
 
     if pair == "btcusd":
@@ -277,7 +467,6 @@ def fetch(pair, minutes, now, since=None):
         if not isinstance(raw, list):
             raise ValueError("Coinbase data error")
 
-        # Coinbase: time, low, high, open, close, volume.
         frame = pd.DataFrame(
             [
                 (row[0], row[3], row[2], row[1], row[4])
@@ -312,8 +501,7 @@ def fetch(pair, minutes, now, since=None):
             index=result["timestamp"],
         ).rename(columns=str.title)
 
-        # All-null Yahoo rows mean "no quote".
-        # Preserve the gap; never fill it with an invented price.
+        # All-null Yahoo rows are missing quotes, not prices.
         frame = frame.loc[
             ~frame[
                 ["Open", "High", "Low", "Close"]
@@ -376,12 +564,15 @@ def signal_check(pair, now):
     gain = wilder_last(change.clip(lower=0))
     loss = wilder_last(-change.clip(upper=0))
 
-    if gain == loss == 0:
-        rsi = 50
-    elif loss == 0:
-        rsi = 100
-    else:
-        rsi = 100 - 100 / (1 + gain / loss)
+    rsi = (
+        50
+        if gain == loss == 0
+        else (
+            100
+            if loss == 0
+            else 100 - 100 / (1 + gain / loss)
+        )
+    )
 
     true_range = pd.concat(
         [
@@ -393,21 +584,25 @@ def signal_check(pair, now):
     ).max(axis=1)
 
     atr = wilder_last(true_range)
-    price = float(close.iloc[-1])
+    current_price = float(close.iloc[-1])
 
-    side = 0
-    if e20 > e50 and 55 < rsi < 70:
-        side = 1
-    elif e20 < e50 and 30 < rsi < 45:
-        side = -1
+    side = (
+        1
+        if e20 > e50 and 55 < rsi < 70
+        else (
+            -1
+            if e20 < e50 and 30 < rsi < 45
+            else 0
+        )
+    )
 
     if (
         not all(
             math.isfinite(x)
-            for x in (price, atr, rsi, e20, e50)
+            for x in (current_price, atr, rsi, e20, e50)
         )
         or atr <= 0
-        or abs(e20 - e50) / price < 0.0012
+        or abs(e20 - e50) / current_price < 0.0012
         or not side
     ):
         return (
@@ -416,39 +611,32 @@ def signal_check(pair, now):
             f"WAIT: EMA/RSI/ATR filter; RSI {rsi:.1f}.",
         )
 
-    setup = {
-        "pair": pair,
-        "candle": candle,
-        "side": side,
-        "reference": price,
-        "distance": 1.5 * atr,
-        "rsi": rsi,
-    }
-
-    return frame, setup, "Qualified paper setup."
+    return (
+        frame,
+        {
+            "pair": pair,
+            "candle": candle,
+            "side": side,
+            "reference": current_price,
+            "distance": 1.5 * atr,
+            "rsi": rsi,
+        },
+        "Qualified paper setup.",
+    )
 
 
 def advance(trade, ts, bar):
-    """
-    Pure state transition.
-
-    Returns accounting events:
-        (timestamp, event_kind, delta_R)
-
-    Original stop is retained after TP1.
-    """
+    """Financial state transitions; original stop retained."""
     t = trade
     events = []
 
     if t["status"] == "PENDING":
-        invalid_entry = (
+        if (
             ts != t["fill_at"]
             or not in_session(t["pair"], ts)
             or abs(bar.Open - t["reference"])
             > 0.25 * t["distance"]
-        )
-
-        if invalid_entry:
+        ):
             t.update(
                 status="CANCELLED",
                 closed=ts,
@@ -466,13 +654,11 @@ def advance(trade, ts, bar):
             tp1=t["entry"] + t["side"] * t["distance"],
             tp2=t["entry"] + 2 * t["side"] * t["distance"],
         )
-
-        # Charge estimated full-trade costs once, at entry.
         events.append((ts, "COST", -t["cost_r"]))
 
     side = t["side"]
 
-    stop_hit = (
+    stop = (
         bar.Low <= t["sl"]
         if side == 1
         else bar.High >= t["sl"]
@@ -488,21 +674,18 @@ def advance(trade, ts, bar):
         else bar.Low <= t["tp2"]
     )
 
-    # Strict stop-first whenever both SL and a target are touched.
-    if stop_hit:
+    if stop:
         fill = (
             min(bar.Open, t["sl"])
             if side == 1
             else max(bar.Open, t["sl"])
         )
-
         delta = (
             t["remaining"]
             * side
             * (fill - t["entry"])
             / t["distance"]
         )
-
         events.append((ts + 300, "SL", delta))
         t["gross_r"] += delta
 
@@ -515,14 +698,16 @@ def advance(trade, ts, bar):
 
     else:
         if hit1 and t["status"] == "OPEN":
-            t.update(status="PARTIAL", remaining=0.5)
+            t.update(
+                status="PARTIAL",
+                remaining=0.5,
+            )
             t["gross_r"] += 0.5
             events.append((ts + 300, "TP1", 0.5))
 
         if hit2:
             delta = t["remaining"] * 2
             t["gross_r"] += delta
-
             events.append((ts + 300, "TP2", delta))
 
             t.update(
@@ -545,7 +730,7 @@ def advance(trade, ts, bar):
 
 
 class Store:
-    """Public methods run through asyncio.to_thread."""
+    """Public methods are called through asyncio.to_thread."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -574,8 +759,6 @@ class Store:
         with self.db() as db:
             db.execute("PRAGMA journal_mode=WAL")
 
-            # Namespaced tables preserve existing V11/V12 tables.
-            # Incompatible legacy accounting is not silently imported.
             db.executescript(f"""
                 CREATE TABLE IF NOT EXISTS {M}(
                     key TEXT PRIMARY KEY,
@@ -678,7 +861,7 @@ class Store:
             ).fetchone()[0]
 
         LOG.info(
-            "Ledger %s initialized; balance %.2f; "
+            "Ledger %s initialized; initial balance %.2f; "
             "legacy preserved=%s",
             ledger,
             balance,
@@ -694,7 +877,14 @@ class Store:
 
         return ledger
 
-    def notify(self, db, text, now, extra=None):
+    def notify(
+        self,
+        db,
+        text,
+        now,
+        extra=None,
+        chart=None,
+    ):
         chats = {
             row[0]
             for row in db.execute(
@@ -705,10 +895,26 @@ class Store:
         if extra in self.cfg.chats:
             chats.add(extra)
 
+        payload = (
+            json.dumps(
+                {
+                    "ux_version": 1,
+                    "text": text,
+                    "chart": chart,
+                },
+                allow_nan=False,
+            )
+            if chart
+            else text
+        )
+
         db.executemany(
-            f"INSERT INTO {O}(chat_id, text, created) "
-            "VALUES (?, ?, ?)",
-            [(chat_id, text, now) for chat_id in chats],
+            f"INSERT INTO {O}(chat_id,text,created) "
+            "VALUES (?,?,?)",
+            [
+                (chat_id, payload, now)
+                for chat_id in chats
+            ],
         )
 
     def subscribe(self, chat_id, enabled):
@@ -748,7 +954,13 @@ class Store:
                 )
             )
 
-    def reserve(self, setup, now, requester=None):
+    def reserve(
+        self,
+        setup,
+        now,
+        requester=None,
+        frame=None,
+    ):
         pair = setup["pair"]
 
         levels = (
@@ -761,8 +973,8 @@ class Store:
         if (
             setup["distance"] <= 0
             or any(
-                not math.isfinite(x) or x <= 0
-                for x in levels
+                not math.isfinite(value) or value <= 0
+                for value in levels
             )
         ):
             return "WAIT: invalid projected price levels."
@@ -801,13 +1013,15 @@ class Store:
             ):
                 return "Existing active paper trade for this pair."
 
-            duplicate = db.execute(
+            if db.execute(
                 f"SELECT 1 FROM {T} "
                 "WHERE pair=? AND (candle=? OR created>?)",
-                (pair, setup["candle"], now - 21600),
-            ).fetchone()
-
-            if duplicate:
+                (
+                    pair,
+                    setup["candle"],
+                    now - 21600,
+                ),
+            ).fetchone():
                 return (
                     "Duplicate/cooldown: already processed; "
                     "cooldown is six hours."
@@ -824,7 +1038,7 @@ class Store:
                 f"SELECT COALESCE(SUM(pnl),0) FROM {E}"
             ).fetchone()[0]
 
-            day_start = datetime.fromtimestamp(
+            day = datetime.fromtimestamp(
                 now, self.tz
             ).replace(
                 hour=0,
@@ -836,7 +1050,7 @@ class Store:
             losses = -db.execute(
                 f"SELECT COALESCE(SUM(pnl),0) FROM {E} "
                 "WHERE ts>=? AND pnl<0",
-                (day_start,),
+                (day,),
             ).fetchone()[0]
 
             exposure = sum(
@@ -864,10 +1078,9 @@ class Store:
             cursor = db.execute(
                 f"""
                     INSERT INTO {T}(
-                        pair, candle, created, fill_at, checked,
-                        side, reference, distance, risk,
-                        cost_r, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        pair,candle,created,fill_at,checked,
+                        side,reference,distance,risk,cost_r,status
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     pair,
@@ -884,21 +1097,54 @@ class Store:
                 ),
             )
 
+            # A successful manual signal follows its outcomes.
+            if requester in self.cfg.chats:
+                db.execute(
+                    f"INSERT OR IGNORE INTO {S} VALUES (?)",
+                    (requester,),
+                )
+
             text = (
-                f"PAPER #{cursor.lastrowid} "
+                "🚨 NEW PAPER SIGNAL: "
                 f"{'BUY' if setup['side'] == 1 else 'SELL'} "
-                f"{pair.upper()}\n"
-                f"Reference {setup['reference']:.5f}; "
-                f"SL distance {setup['distance']:.5f}; "
-                f"RSI {setup['rsi']:.1f}\n"
-                f"Risk ${risk:.2f} + "
-                f"{self.cfg.cost_r:.2f}R costs. "
-                "Pending next 5m open.\n"
-                "50% at 1R; 50% at 2R; "
-                "original stop retained. No broker order."
+                f"{pair.upper()} | #{cursor.lastrowid}\n"
+                f"📉 Entry Ref: {price(pair, setup['reference'])}\n"
+                f"🛑 SL Dist: {price(pair, setup['distance'])} "
+                "(1.5 ATR)\n"
+                f"📊 RSI: {setup['rsi']:.1f}\n"
+                f"💰 Risk: ${risk:.2f} + "
+                f"{self.cfg.cost_r:.2f}R assumed costs\n"
+                "⏳ Status: PENDING — next 5m open at "
+                f"{local_time(fill_at)}\n"
+                "50% at 1R; 50% at 2R. Original SL retained.\n"
+                "🧪 PAPER ONLY"
             )
 
-            self.notify(db, text, now, requester)
+            snapshot = dict(
+                setup,
+                id=cursor.lastrowid,
+                entry=None,
+                sl=None,
+                tp1=None,
+                tp2=None,
+            )
+
+            image = chart_snapshot(
+                frame,
+                pair,
+                "1H",
+                "PENDING",
+                snapshot,
+            )
+
+            self.notify(
+                db,
+                text,
+                now,
+                requester,
+                image,
+            )
+
             return text
 
     def track(self, pair, frame, now):
@@ -928,6 +1174,8 @@ class Store:
                     trade["status"] = trade["review_from"]
                     trade["reason"] = None
 
+                emitted = False
+
                 for index, bar in bars.iterrows():
                     ts = int(index)
 
@@ -951,13 +1199,14 @@ class Store:
                         )
                         break
 
-                    events = advance(trade, ts, bar)
+                    bar_events = advance(trade, ts, bar)
 
-                    for stamp, kind, delta_r in events:
+                    # Notify each accounting event, not just final status.
+                    for stamp, kind, delta_r in bar_events:
                         db.execute(
                             f"INSERT INTO {E}"
-                            "(trade_id, ts, kind, pnl) "
-                            "VALUES (?, ?, ?, ?)",
+                            "(trade_id,ts,kind,pnl) "
+                            "VALUES (?,?,?,?)",
                             (
                                 trade["id"],
                                 stamp,
@@ -965,6 +1214,30 @@ class Store:
                                 delta_r * trade["risk"],
                             ),
                         )
+
+                        notice = (
+                            "OPEN" if kind == "COST" else kind
+                        )
+
+                        image = chart_snapshot(
+                            frame,
+                            pair,
+                            "5m",
+                            notice,
+                            trade,
+                            ts,
+                        )
+
+                        self.notify(
+                            db,
+                            update_message(
+                                trade, notice, stamp
+                            ),
+                            now,
+                            chart=image,
+                        )
+
+                        emitted = True
 
                     if trade["status"] in (
                         "CLOSED", "CANCELLED"
@@ -1022,30 +1295,50 @@ class Store:
                     + [trade["id"]],
                 )
 
-                if trade["status"] != old_status:
-                    text = (
-                        f"PAPER #{trade['id']} "
-                        f"{pair.upper()}: {trade['status']}"
+                if (
+                    trade["status"] in ("CANCELLED", "REVIEW")
+                    and trade["status"] != old_status
+                ):
+                    image = chart_snapshot(
+                        frame,
+                        pair,
+                        "5m",
+                        trade["status"],
+                        trade,
+                        trade["checked"],
                     )
 
-                    if trade["entry"] is not None:
-                        text += (
-                            f"\nEntry {trade['entry']:.5f}; "
-                            f"SL {trade['sl']:.5f}; "
-                            f"TP1 {trade['tp1']:.5f}; "
-                            f"TP2 {trade['tp2']:.5f}"
-                        )
+                    self.notify(
+                        db,
+                        update_message(
+                            trade, trade["status"], now
+                        ),
+                        now,
+                        chart=image,
+                    )
 
-                    if trade["net_r"] is not None:
-                        text += (
-                            f"\nNet {trade['net_r']:.2f}R / "
-                            f"${trade['net_r'] * trade['risk']:.2f}"
-                        )
+                elif (
+                    old_status == "REVIEW"
+                    and trade["status"] != old_status
+                    and not emitted
+                ):
+                    image = chart_snapshot(
+                        frame,
+                        pair,
+                        "5m",
+                        "RESUMED",
+                        trade,
+                        trade["checked"],
+                    )
 
-                    if trade["reason"]:
-                        text += "\n" + trade["reason"]
-
-                    self.notify(db, text, now)
+                    self.notify(
+                        db,
+                        update_message(
+                            trade, "RESUMED", now
+                        ),
+                        now,
+                        chart=image,
+                    )
 
     def summary(self, days=None):
         now = int(time.time())
@@ -1058,10 +1351,12 @@ class Store:
                     "WHERE key='initial_balance'"
                 ).fetchone()[0]
             )
+
             ledger = db.execute(
                 f"SELECT value FROM {M} "
                 "WHERE key='ledger_id'"
             ).fetchone()[0]
+
             legacy = db.execute(
                 f"SELECT value FROM {M} "
                 "WHERE key='legacy_preserved'"
@@ -1118,6 +1413,7 @@ class Store:
                 trade["net_r"] > 0
                 for trade in closed
             )
+
             winrate = (
                 f"{wins / len(closed) * 100:.1f}%"
                 if closed
@@ -1243,60 +1539,313 @@ class Store:
             else:
                 db.execute(
                     f"UPDATE {O} "
-                    "SET attempts=attempts+1, next_try=? "
+                    "SET attempts=attempts+1,next_try=? "
                     "WHERE id=?",
                     (now + delay, message["id"]),
                 )
 
 
-def make_chart(frame, pair):
+def make_chart(
+    frame,
+    pair,
+    trade=None,
+    timeframe="1H",
+    event="ANALYSIS",
+):
     os.environ.setdefault(
         "MPLCONFIGDIR",
         "/tmp/jarvis-mpl",
     )
 
-    import matplotlib
+    with PLOT_LOCK:
+        import matplotlib
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+        matplotlib.use("Agg")
 
-    fig, ax = plt.subplots(figsize=(7, 3.5))
+        import matplotlib.dates as mdates
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import FormatStrFormatter
 
-    try:
-        for i, row in enumerate(
-            frame.tail(40).itertuples()
-        ):
-            color = (
-                "green"
-                if row.Close >= row.Open
-                else "red"
+        fig, ax = plt.subplots(figsize=(9, 4.8))
+
+        try:
+            data = frame.tail(40)
+            dates = pd.to_datetime(
+                data.index,
+                unit="s",
+                utc=True,
+            ).to_pydatetime()
+
+            for stamp, row in zip(
+                dates, data.itertuples()
+            ):
+                color = (
+                    "#138b58"
+                    if row.Close >= row.Open
+                    else "#d44343"
+                )
+
+                ax.plot(
+                    [stamp, stamp],
+                    [row.Low, row.High],
+                    color=color,
+                    lw=1,
+                )
+                ax.plot(
+                    [stamp, stamp],
+                    [row.Open, row.Close],
+                    color=color,
+                    lw=4,
+                )
+
+            if trade:
+                entry = trade.get("entry")
+                reference = trade.get("reference")
+
+                levels = [
+                    (
+                        "ENTRY"
+                        if entry is not None
+                        else "REF (planned)",
+                        entry
+                        if entry is not None
+                        else reference,
+                        "#2864c8",
+                    )
+                ]
+
+                for key, color in (
+                    ("sl", "#d44343"),
+                    ("tp1", "#c78c00"),
+                    ("tp2", "#138b58"),
+                ):
+                    value = trade.get(key)
+
+                    if (
+                        value is None
+                        and reference is not None
+                        and trade.get("distance") is not None
+                    ):
+                        multiplier = (
+                            -1
+                            if key == "sl"
+                            else (1 if key == "tp1" else 2)
+                        )
+
+                        value = (
+                            reference
+                            + multiplier
+                            * trade["side"]
+                            * trade["distance"]
+                        )
+
+                    levels.append(
+                        (key.upper(), value, color)
+                    )
+
+                for label, value, color in levels:
+                    if value is not None and value > 0:
+                        ax.axhline(
+                            value,
+                            color=color,
+                            linestyle="--",
+                            lw=1,
+                            label=(
+                                f"{label}: {price(pair, value)}"
+                            ),
+                        )
+
+                ax.legend(loc="best", fontsize=8)
+
+            ax.set_title(
+                f"{pair.upper()} | {timeframe} | "
+                f"{event} | PAPER"
+            )
+            ax.set_xlabel(
+                "Candle open time — IST | "
+                "completed candles only"
+            )
+            ax.set_ylabel("USD / quote price")
+
+            if len(dates):
+                padding = timedelta(
+                    seconds=(
+                        3600 if timeframe == "1H" else 300
+                    )
+                )
+                ax.set_xlim(
+                    dates[0] - padding,
+                    dates[-1] + padding,
+                )
+
+            ax.xaxis.set_major_locator(
+                mdates.AutoDateLocator(
+                    minticks=3,
+                    maxticks=6,
+                )
+            )
+            ax.xaxis.set_major_formatter(
+                mdates.DateFormatter(
+                    "%d %b\n%H:%M",
+                    tz=DISPLAY_TZ,
+                )
+            )
+            ax.yaxis.set_major_formatter(
+                FormatStrFormatter(
+                    "%.2f"
+                    if pair == "btcusd"
+                    else "%.5f"
+                )
             )
 
-            ax.plot(
-                [i, i],
-                [row.Low, row.High],
-                color=color,
-                lw=1,
-            )
-            ax.plot(
-                [i, i],
-                [row.Open, row.Close],
-                color=color,
-                lw=4,
+            ax.grid(alpha=0.15)
+            fig.tight_layout()
+
+            output = io.BytesIO()
+            fig.savefig(
+                output,
+                format="png",
+                dpi=120,
             )
 
-        ax.set_title(
-            f"{pair.upper()} | completed 1H candles | PAPER"
-        )
-        fig.tight_layout()
+            return output.getvalue()
 
-        output = io.BytesIO()
-        fig.savefig(output, format="png", dpi=110)
+        finally:
+            plt.close(fig)
 
-        return output.getvalue()
 
-    finally:
-        plt.close(fig)
+def render_notice(raw):
+    text, snapshot = unpack_notice(raw)
+
+    if not snapshot:
+        return text, None
+
+    frame = pd.DataFrame(
+        snapshot["rows"],
+        columns=["ts", "Open", "High", "Low", "Close"],
+    ).set_index("ts")
+
+    return (
+        text,
+        make_chart(
+            frame,
+            snapshot["pair"],
+            snapshot.get("trade"),
+            snapshot["timeframe"],
+            snapshot["event"],
+        ),
+    )
+
+
+def explain_check(pair, now):
+    # The original signal_check remains the entry authority.
+    frame, setup, reason = signal_check(pair, now)
+
+    if setup:
+        return frame, setup, reason
+
+    next_ts = next_window(pair, now)
+
+    following = (
+        "Next scheduled entry window: "
+        f"{local_time(next_ts)}–"
+        f"{datetime.fromtimestamp(next_ts + 600, DISPLAY_TZ).strftime('%H:%M')} IST."
+        if next_ts is not None
+        else "Next eligible session is unavailable."
+    )
+
+    if len(frame) >= 200:
+        candle = int(frame.index[-1])
+
+        if not 0 <= now - (candle + 3600) < 600:
+            expected = (int(now) // 3600) * 3600
+
+            if (
+                now - expected < 600
+                and in_session(pair, now)
+            ):
+                text = (
+                    "⏳ WAIT: The provider has not supplied "
+                    "the latest completed 1H candle yet. "
+                    "Retry shortly."
+                )
+            else:
+                text = (
+                    "⏳ WAIT: You are outside the 10-minute "
+                    "entry window. No late paper trade was created."
+                )
+
+            # Explanation only. This cannot authorize a late entry.
+            close = frame.Close
+            e20 = float(
+                close.ewm(
+                    span=20,
+                    adjust=False,
+                ).mean().iloc[-1]
+            )
+            e50 = float(
+                close.ewm(
+                    span=50,
+                    adjust=False,
+                ).mean().iloc[-1]
+            )
+
+            delta = close.diff().dropna()
+            gain = wilder_last(delta.clip(lower=0))
+            loss = wilder_last(-delta.clip(upper=0))
+
+            rsi = (
+                50
+                if gain == loss == 0
+                else (
+                    100
+                    if loss == 0
+                    else 100 - 100 / (1 + gain / loss)
+                )
+            )
+
+            true_range = pd.concat(
+                [
+                    frame.High - frame.Low,
+                    (frame.High - close.shift()).abs(),
+                    (frame.Low - close.shift()).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+
+            aligned = (
+                (
+                    (e20 > e50 and 55 < rsi < 70)
+                    or (e20 < e50 and 30 < rsi < 45)
+                )
+                and abs(e20 - e50)
+                / float(close.iloc[-1]) >= 0.0012
+                and wilder_last(true_range) > 0
+            )
+
+            if aligned:
+                text += (
+                    "\n📊 Indicators align on the last "
+                    "available closed candle, but its entry "
+                    "window is over. A fresh setup must "
+                    "qualify again."
+                )
+
+            text += (
+                "\n🕒 Last candle closed: "
+                f"{local_time(candle + 3600)}\n"
+                f"{following}"
+            )
+
+            if pair == "btcusd":
+                text += (
+                    "\nBTC hours close at :00 UTC "
+                    "= :30 IST, not :00 IST."
+                )
+
+            return frame, None, text
+
+    return frame, None, "⏳ " + reason + "\n" + following
 
 
 class Engine:
@@ -1308,12 +1857,14 @@ class Engine:
         self.pipeline = asyncio.Lock()
         self.delivery_lock = asyncio.Lock()
         self.chart_lock = asyncio.Lock()
-
-        # Network slots are separate from database work.
         self.workers = asyncio.Semaphore(3)
 
     async def run(self, function, *args):
-        if function in (fetch, signal_check):
+        if function in (
+            fetch,
+            signal_check,
+            explain_check,
+        ):
             async with self.workers:
                 return await asyncio.to_thread(
                     function, *args
@@ -1340,7 +1891,13 @@ class Engine:
 
         results = await asyncio.gather(
             *(
-                self.run(fetch, pair, 5, now, since)
+                self.run(
+                    fetch,
+                    pair,
+                    5,
+                    now,
+                    since,
+                )
                 for pair, since in cursors.items()
             ),
             return_exceptions=True,
@@ -1379,7 +1936,7 @@ class Engine:
 
     async def check(self, pair, requester=None):
         frame, setup, reason = await self.run(
-            signal_check,
+            explain_check,
             pair,
             int(time.time()),
         )
@@ -1390,9 +1947,98 @@ class Engine:
                 setup,
                 int(time.time()),
                 requester,
+                frame,
             )
 
+            if (
+                "expired" in reason
+                or "outside session" in reason
+            ):
+                next_ts = next_window(
+                    pair, int(time.time())
+                )
+
+                reason = (
+                    "⏳ "
+                    + reason
+                    + (
+                        "\nNext scheduled check: "
+                        f"{local_time(next_ts)}."
+                        if next_ts
+                        else ""
+                    )
+                )
+
         return frame, reason
+
+    async def broadcast(self, bot, message, cache):
+        raw = message["text"]
+
+        if raw not in cache:
+            try:
+                cache[raw] = await self.run(
+                    render_notice,
+                    raw,
+                )
+            except Exception as exc:
+                text, _ = await self.run(
+                    unpack_notice,
+                    raw,
+                )
+
+                cache[raw] = (
+                    text
+                    + "\n⚠️ Chart unavailable; "
+                    "accounting is unaffected.",
+                    None,
+                )
+
+                LOG.warning(
+                    "Update chart failed: %s",
+                    type(exc).__name__,
+                )
+
+        text, photo = cache[raw]
+        text = f"[event {message['id']}] {text}"
+
+        if photo:
+            caption = (
+                text
+                if len(text.encode("utf-16-le")) // 2 <= 1024
+                else (
+                    "📊 PAPER trade update | "
+                    f"event {message['id']}"
+                )
+            )
+
+            try:
+                await bot.send_photo(
+                    chat_id=message["chat_id"],
+                    photo=io.BytesIO(photo),
+                    caption=caption,
+                )
+
+            except BadRequest:
+                await bot.send_message(
+                    chat_id=message["chat_id"],
+                    text=(
+                        text
+                        + "\n⚠️ Telegram could not attach the chart."
+                    ),
+                )
+                return
+
+            if caption != text:
+                await bot.send_message(
+                    chat_id=message["chat_id"],
+                    text=text,
+                )
+
+        else:
+            await bot.send_message(
+                chat_id=message["chat_id"],
+                text=text,
+            )
 
     async def flush(self, bot):
         if self.delivery_lock.locked():
@@ -1403,6 +2049,7 @@ class Engine:
                 self.store.pending_messages,
                 int(time.time()),
             )
+            cache = {}
 
             for message in messages:
                 if message["chat_id"] not in self.cfg.chats:
@@ -1416,12 +2063,8 @@ class Engine:
                     continue
 
                 try:
-                    await bot.send_message(
-                        chat_id=message["chat_id"],
-                        text=(
-                            f"[event {message['id']}] "
-                            f"{message['text']}"
-                        ),
+                    await self.broadcast(
+                        bot, message, cache
                     )
 
                 except Forbidden:
@@ -1434,15 +2077,16 @@ class Engine:
                     )
 
                 except Exception as exc:
-                    if isinstance(exc, RetryAfter):
-                        retry = exc.retry_after
-                    else:
-                        retry = min(
+                    retry = (
+                        exc.retry_after
+                        if isinstance(exc, RetryAfter)
+                        else min(
                             3600,
                             30 * 2 ** min(
                                 message["attempts"], 7
                             ),
                         )
+                    )
 
                     if hasattr(retry, "total_seconds"):
                         retry = retry.total_seconds()
@@ -1600,9 +2244,20 @@ class Engine:
                     update.effective_chat.id,
                 )
 
-            await message.reply_text(reason)
+            new_signal = reason.startswith(
+                "🚨 NEW PAPER SIGNAL:"
+            )
 
-            if not frame.empty:
+            await message.reply_text(
+                "🔔 Paper signal created; entry/outcome "
+                "updates enabled. Use /stop to unsubscribe."
+                if new_signal
+                else reason
+            )
+
+            await self.flush(context.bot)
+
+            if not new_signal and not frame.empty:
                 try:
                     async with self.chart_lock:
                         photo = await self.run(
@@ -1614,7 +2269,8 @@ class Engine:
                     await message.reply_photo(
                         photo=io.BytesIO(photo),
                         caption=(
-                            "Completed hourly candles; PAPER only."
+                            "📊 Completed 1H candles • "
+                            "timestamps in IST • PAPER only."
                         ),
                     )
 
@@ -1627,11 +2283,12 @@ class Engine:
             await self.flush(context.bot)
 
         elif command in ("stats", "weekly"):
-            text = await self.run(
-                self.store.summary,
-                7 if command == "weekly" else None,
+            await message.reply_text(
+                await self.run(
+                    self.store.summary,
+                    7 if command == "weekly" else None,
+                )
             )
-            await message.reply_text(text)
 
         elif command == "export":
             data = await self.run(self.store.export)
@@ -1662,6 +2319,8 @@ class Engine:
                 "original SL retained.\n"
                 "Strict stop-first if both touched.\n"
                 "Missing history => REVIEW.\n"
+                "🔔 Charts + explicit OPEN / TP1 / TP2 / SL updates.\n"
+                "BTC hourly close :00 UTC = :30 IST.\n"
                 "Paper estimates only; no broker orders "
                 "or guaranteed win rate."
             )
@@ -1747,7 +2406,6 @@ def health_server(health):
 
 
 async def error_handler(update, context):
-    # Avoid logging Telegram URLs/tokens or exposing raw errors.
     LOG.error(
         "Handler/job failed: %s",
         type(context.error).__name__,
